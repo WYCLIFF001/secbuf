@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["THREAD_CACHE","THREAD_CACHE_DROP_GUARD","THREAD_CACHE_SIZE"],"struct":["FastBufferPool","FastPoolStatsInner","FastPooledBuffer","LockFreeQueue","ThreadCacheDropGuard"]};

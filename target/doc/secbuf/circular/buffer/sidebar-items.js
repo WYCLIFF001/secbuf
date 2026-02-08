@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_CBUF_SIZE"],"struct":["CircularBuffer","CircularBufferMemoryStats"]};

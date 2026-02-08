@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["QueueFullError"],"struct":["ConnectionBufferConfig","ConnectionBuffers","ConnectionMemoryStats","PooledConnectionBuffers"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BUF_MAX_INCR","BUF_MAX_SIZE"],"struct":["Buffer"]};
