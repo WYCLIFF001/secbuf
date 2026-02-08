@@ -1,4 +1,5 @@
 # secbuf
+# secbuf
 
 [![Crates.io](https://img.shields.io/crates/v/secbuf.svg)](https://crates.io/crates/secbuf)
 [![Documentation](https://docs.rs/secbuf/badge.svg)](https://docs.rs/secbuf)
@@ -297,7 +298,7 @@ cargo bench
 ## 📚 Documentation
 
 - [API Documentation](https://docs.rs/secbuf)
-- [Examples](https://github.com/WYCLIFF001/secbuf/tree/main/examples)
+- [Examples](https://github.com/yourusername/secbuf/tree/main/examples)
 
 ## 🛠️ Feature Flags
 
@@ -317,6 +318,7 @@ Contributions are welcome! Please:
 5. Submit a pull request
 
 
+
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
@@ -326,7 +328,6 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 - Inspired by [Dropbear SSH](https://github.com/mkj/dropbear)'s secure buffer management
 - Built on the excellent [`zeroize`](https://crates.io/crates/zeroize) crate by RustCrypto
 - Lock-free queues via [`crossbeam`](https://crates.io/crates/crossbeam)
-
 
 
 ## 🔗 Related Projects
