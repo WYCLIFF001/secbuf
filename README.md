@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/secbuf.svg)](https://crates.io/crates/secbuf)
 [![Documentation](https://docs.rs/secbuf/badge.svg)](https://docs.rs/secbuf)
-[![License](https://img.shields.io/crates/l/secbuf.svg)](https://github.com/WYCLIFF001/secbuf#license)
+[![License](https://img.shields.io/crates/l/secbuf.svg)](https://github.com/WYCLIFF001/secbuf/blob/main/LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/WYCLIFF001/secbuf/ci.yml?branch=main)](https://github.com/WYCLIFF001/secbuf/actions)
 
 **Secure, high-performance buffer management for Rust with automatic memory zeroing and aggressive cleanup.**
@@ -297,7 +297,7 @@ cargo bench
 ## 📚 Documentation
 
 - [API Documentation](https://docs.rs/secbuf)
-- [Examples](https://github.com/yourusername/secbuf/tree/main/examples)
+- [Examples](https://github.com/WYCLIFF/secbuf/tree/main/examples)
 
 ## 🛠️ Feature Flags
 
