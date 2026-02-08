@@ -1,5 +1,4 @@
 # secbuf
-# secbuf
 
 [![Crates.io](https://img.shields.io/crates/v/secbuf.svg)](https://crates.io/crates/secbuf)
 [![Documentation](https://docs.rs/secbuf/badge.svg)](https://docs.rs/secbuf)
