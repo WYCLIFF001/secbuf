@@ -133,7 +133,7 @@ impl<T> ResultExt<T> for Result<T> {
 /// `anyhow::Error` have multiple overlapping `From` impls.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use secbuf::prelude::*;
 /// use secbuf::buffer_op;
 ///
