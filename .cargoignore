@@ -1,0 +1,25 @@
+# Rust build output
+target/
+Cargo.lock
+
+# IDE junk
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+
+# Benchmarks not needed
+benches/
+
+# Tests output
+*.log
+
+# Git stuff
+.git/
+.github/
+
+# Anything else big
+*.zip
+*.tar.gz
+*.rar
