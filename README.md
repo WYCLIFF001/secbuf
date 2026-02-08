@@ -297,7 +297,7 @@ cargo bench
 ## 📚 Documentation
 
 - [API Documentation](https://docs.rs/secbuf)
-- [Examples](https://github.com/WYCLIFF/secbuf/tree/main/examples)
+- [Examples](https://github.com/WYCLIFF001/secbuf/tree/main/examples)
 
 ## 🛠️ Feature Flags
 
