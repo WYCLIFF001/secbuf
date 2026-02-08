@@ -1,2 +1,0 @@
-window.ALL_CRATES = ["anyhow","buffer","crossbeam","crossbeam_channel","crossbeam_deque","crossbeam_epoch","crossbeam_queue","crossbeam_utils","libc","proc_macro2","quote","secbuf","syn","unicode_ident","zeroize","zeroize_derive"];
-//{"start":21,"fragment_lengths":[8,9,12,20,18,18,18,18,7,14,8,9,6,16,10,17]}

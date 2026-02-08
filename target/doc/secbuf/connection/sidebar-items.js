@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["QueueFullError"],"struct":["BufferDiagnostic","ConnectionBufferConfig","ConnectionBuffers","ConnectionDiagnostics","ConnectionMemoryStats","PooledConnectionBuffers"]};

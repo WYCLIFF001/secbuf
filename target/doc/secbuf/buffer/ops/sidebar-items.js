@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["MAX_PTR_LEN","MAX_STRING_LEN"]};

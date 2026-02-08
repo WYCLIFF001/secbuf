@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["config","fast","standard","stats"],"struct":["BufferPool","FastBufferPool","FastPoolStats","FastPooledBuffer","PoolConfig","PoolStats","PooledBuffer"]};
