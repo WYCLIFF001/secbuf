@@ -368,7 +368,7 @@ impl CircularBuffer {
     /// Frees the buffer and securely zeroes memory.
     ///
     /// Explicit cleanup for connection/session termination.
-    /// Converts the Box<[u8]> to Vec<u8> in-place and securely zeros it.
+    /// Converts the Box<[u8]> to `Vec<u8>` in-place and securely zeros it.
     ///
     /// BUGFIX: Previous implementation created a copy with .to_vec(), which zeroed
     /// the copy but left the original data unzeroed. Fixed to properly convert and
@@ -405,7 +405,7 @@ impl Drop for CircularBuffer {
     /// then dropped the original unzeroed Box<[u8]>. This meant sensitive data could remain
     /// in the original allocation.
     ///
-    /// Fixed to properly convert Box<[u8]> to Vec<u8> in-place using into_vec(), which
+    /// Fixed to properly convert Box<[u8]> to `Vec<u8>` in-place using into_vec(), which
     /// maintains ownership of the original allocation and allows us to securely zero it
     /// before it's freed.
     fn drop(&mut self) {
