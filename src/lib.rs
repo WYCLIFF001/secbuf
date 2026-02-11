@@ -36,9 +36,7 @@ pub use pool::{
 pub mod prelude {
     pub use crate::buffer::Buffer;
     pub use crate::circular::CircularBuffer;
-    pub use crate::connection::{
-        ConnectionBufferConfig, ConnectionBuffers, PooledConnectionBuffers,
-    };
+    pub use crate::connection::{ConnectionBufferConfig, ConnectionBuffers, PooledConnectionBuffers};
     pub use crate::error::{BufferError, Result};
     pub use crate::pool::{
         BufferPool, FastBufferPool, FastPoolStats, FastPooledBuffer, PoolConfig, PoolStats,

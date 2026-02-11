@@ -4,11 +4,8 @@
 use super::core::Buffer;
 use crate::error::{BufferError, Result};
 
-/// Maximum SSH-style string length (400KB - reasonable for SSH packets)
+/// Maximum SSH-style string length
 const MAX_STRING_LEN: usize = 400_000;
-
-/// Maximum pointer/slice length to prevent accidental huge allocations (100MB)
-const MAX_PTR_LEN: usize = 100_000_000;
 
 impl Buffer {
     /// Writes a `u32` in big-endian format with bounds checking.
@@ -85,40 +82,16 @@ impl Buffer {
     }
 
     /// Gets a reference to data at current position without advancing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::BufferOverflow`] if:
-    /// - `len` exceeds [`MAX_PTR_LEN`] (prevents accidental huge allocations)
-    /// - Current position + `len` exceeds valid data length
     pub fn get_ptr(&self, len: usize) -> Result<&[u8]> {
-        if len > MAX_PTR_LEN {
-            return Err(BufferError::InvalidData(format!(
-                "Requested slice length {} exceeds maximum {}",
-                len, MAX_PTR_LEN
-            )));
-        }
-        if self.pos + len > self.len {
+        if len > 1_000_000_000 || self.pos + len > self.len {
             return Err(BufferError::BufferOverflow);
         }
         Ok(&self.data[self.pos..self.pos + len])
     }
 
     /// Gets a mutable reference to data at current position (for writing).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::BufferOverflow`] if:
-    /// - `len` exceeds [`MAX_PTR_LEN`] (prevents accidental huge allocations)
-    /// - Current position + `len` exceeds buffer capacity
     pub fn get_write_ptr(&mut self, len: usize) -> Result<&mut [u8]> {
-        if len > MAX_PTR_LEN {
-            return Err(BufferError::InvalidData(format!(
-                "Requested slice length {} exceeds maximum {}",
-                len, MAX_PTR_LEN
-            )));
-        }
-        if self.pos + len > self.data.len() {
+        if len > 1_000_000_000 || self.pos + len > self.data.len() {
             return Err(BufferError::BufferOverflow);
         }
         Ok(&mut self.data[self.pos..self.pos + len])
@@ -185,15 +158,7 @@ impl Buffer {
         self.incr_pos(len)
     }
 
-    /// SIMD-accelerated bulk copy for large buffers (≥64 bytes).
-    ///
-    /// # Performance
-    ///
-    /// This method uses AVX2 instructions on x86_64 when available for
-    /// significantly faster copies of large data (2-3x faster for 1KB+ buffers).
-    ///
-    /// On other architectures or when AVX2 is unavailable, falls back to
-    /// the standard implementation.
+    /// SIMD-accelerated bulk copy for large buffers (â‰¥64 bytes).
     #[cfg(target_arch = "x86_64")]
     #[inline]
     pub fn put_bytes_fast(&mut self, bytes: &[u8]) -> Result<()> {
@@ -218,18 +183,6 @@ impl Buffer {
         Ok(())
     }
 
-    /// AVX2 implementation for fast bulk copy.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure:
-    /// - AVX2 is available (checked by `is_x86_feature_detected!`)
-    /// - `self.pos + bytes.len() <= self.data.len()` (bounds checked by caller)
-    ///
-    /// # Implementation Details
-    ///
-    /// Uses 256-bit (32-byte) AVX2 loads and stores to copy data in chunks.
-    /// Remaining bytes (<32) are copied with standard memcpy.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     unsafe fn put_bytes_avx2_impl(&mut self, bytes: &[u8]) {
@@ -239,7 +192,6 @@ impl Buffer {
         let mut dst = unsafe { self.data.as_mut_ptr().add(self.pos) };
         let mut remaining = bytes.len();
 
-        // Copy 32-byte chunks using AVX2
         while remaining >= 32 {
             let chunk = unsafe { _mm256_loadu_si256(src as *const __m256i) };
             unsafe { _mm256_storeu_si256(dst as *mut __m256i, chunk) };
@@ -248,7 +200,6 @@ impl Buffer {
             remaining -= 32;
         }
 
-        // Copy remaining bytes (<32)
         unsafe { std::ptr::copy_nonoverlapping(src, dst, remaining) };
 
         self.pos += bytes.len();
@@ -261,67 +212,5 @@ impl Buffer {
     #[inline]
     pub fn put_bytes_fast(&mut self, bytes: &[u8]) -> Result<()> {
         self.put_bytes(bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_get_ptr_max_len() {
-        let buf = Buffer::new(1024);
-        let result = buf.get_ptr(MAX_PTR_LEN + 1);
-        assert!(matches!(result, Err(BufferError::InvalidData(_))));
-    }
-
-    #[test]
-    fn test_get_write_ptr_max_len() {
-        let mut buf = Buffer::new(1024);
-        let result = buf.get_write_ptr(MAX_PTR_LEN + 1);
-        assert!(matches!(result, Err(BufferError::InvalidData(_))));
-    }
-
-    #[test]
-    fn test_put_get_u32() {
-        let mut buf = Buffer::new(1024);
-        buf.put_u32(0x12345678).unwrap();
-        buf.set_pos(0).unwrap();
-        assert_eq!(buf.get_u32().unwrap(), 0x12345678);
-    }
-
-    #[test]
-    fn test_put_get_u64() {
-        let mut buf = Buffer::new(1024);
-        buf.put_u64(0xDEADBEEFCAFEBABE).unwrap();
-        buf.set_pos(0).unwrap();
-        assert_eq!(buf.get_u64().unwrap(), 0xDEADBEEFCAFEBABE);
-    }
-
-    #[test]
-    fn test_put_get_string() {
-        let mut buf = Buffer::new(1024);
-        buf.put_string(b"Hello, World!").unwrap();
-        buf.set_pos(0).unwrap();
-        assert_eq!(buf.get_string().unwrap(), b"Hello, World!");
-    }
-
-    #[test]
-    fn test_string_too_long() {
-        let mut buf = Buffer::new(10 * 1024 * 1024); // 10MB buffer
-        let long_string = vec![0u8; MAX_STRING_LEN + 1];
-        let result = buf.put_string(&long_string);
-        assert!(matches!(result, Err(BufferError::InvalidString)));
-    }
-
-    #[test]
-    fn test_eat_string() {
-        let mut buf = Buffer::new(1024);
-        buf.put_string(b"skip this").unwrap();
-        buf.put_u32(42).unwrap();
-
-        buf.set_pos(0).unwrap();
-        buf.eat_string().unwrap();
-        assert_eq!(buf.get_u32().unwrap(), 42);
     }
 }

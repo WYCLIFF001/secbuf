@@ -1,48 +1,18 @@
 // src/buffer/core.rs
-//! Core buffer structure with aggressive memory management
+//! Core buffer structure and basic operations
 //!
-//! This module provides the fundamental [`Buffer`] type with position tracking,
-//! automatic secure memory zeroing on drop, and aggressive memory cleanup capabilities
-//! to prevent memory spikes and unbounded growth in long-running services.
-//!
-//! # Memory Management Strategy
-//!
-//! The buffer provides three levels of cleanup:
-//! 1. **Automatic**: Memory is securely zeroed on drop (via `#[zeroize(drop)]`)
-//! 2. **Periodic**: Reset and trim oversized buffers during idle periods
-//! 3. **Aggressive**: Force shrink when memory pressure is detected
-//!
-//! # Examples
-//!
-//! ```
-//! use secbuf::Buffer;
-//! # use secbuf::BufferError;
-//!
-//! // Basic usage
-//! let mut buf = Buffer::new(1024);
-//! buf.put_u32(42)?;
-//! buf.put_bytes(b"hello")?;
-//!
-//! // Detect waste
-//! if buf.is_wasteful() {
-//!     println!("Buffer has {} bytes overhead", buf.memory_overhead());
-//! }
-//!
-//! // Aggressive cleanup when needed
-//! buf.aggressive_shrink(512); // Keep only 512 bytes capacity
-//! # Ok::<(), BufferError>(())
-//! ```
+//! This module provides the fundamental [`Buffer`] type with position tracking
+//! and automatic secure memory zeroing on drop.
 
 use crate::error::{BufferError, Result};
 use zeroize::Zeroize;
 
 /// Maximum single increment to prevent integer overflow
-const BUF_MAX_INCR: usize = 1_000_000_000;
-
+pub const BUF_MAX_INCR: usize = 1_000_000_000;
 /// Maximum buffer size (1GB)
 pub const BUF_MAX_SIZE: usize = 1_000_000_000;
 
-/// A high-performance linear buffer with aggressive memory management.
+/// A high-performance linear buffer with position tracking.
 ///
 /// The buffer automatically and securely zeros its memory on drop using
 /// the [`zeroize`] crate, which provides compiler-resistant memory clearing.
@@ -50,23 +20,7 @@ pub const BUF_MAX_SIZE: usize = 1_000_000_000;
 /// # Memory Safety
 ///
 /// All buffer memory is automatically zeroed when the buffer is dropped,
-/// preventing sensitive data from remaining in memory. Additional cleanup
-/// methods provide explicit control for long-running services.
-///
-/// # Memory Management
-///
-/// The buffer provides several cleanup strategies:
-///
-/// - [`reset`](Self::reset): Clear position/length without zeroing (fast, for reuse)
-/// - [`burn`](Self::burn): Securely zero all memory
-/// - [`burn_and_free_memory`](Self::burn_and_free_memory): Zero and release capacity
-/// - [`aggressive_shrink`](Self::aggressive_shrink): Force capacity reduction
-/// - [`reset_and_trim`](Self::reset_and_trim): Conditional shrinking for efficiency
-///
-/// # Waste Detection
-///
-/// Use [`is_wasteful`](Self::is_wasteful) and [`memory_overhead`](Self::memory_overhead)
-/// to detect buffers with excessive unused capacity that should be shrunk.
+/// preventing sensitive data from remaining in memory.
 ///
 /// # Examples
 ///
@@ -74,66 +28,32 @@ pub const BUF_MAX_SIZE: usize = 1_000_000_000;
 /// use secbuf::Buffer;
 /// # use secbuf::BufferError;
 ///
-/// let mut buf = Buffer::try_new(1024)?;
+/// let mut buf = Buffer::new(1024);
 /// buf.put_u32(42)?;
 /// buf.put_bytes(b"hello")?;
-///
-/// // Check for waste
-/// if buf.is_wasteful() {
-///     // Trim to reasonable size
-///     buf.reset_and_trim(512);
-/// }
 /// # Ok::<(), BufferError>(())
 /// ```
-#[derive(Zeroize)]
+#[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct Buffer {
     /// Internal data storage (securely erased on drop)
     pub(crate) data: Vec<u8>,
     /// Current read/write position
-    pub pos: usize,
+    pub(crate) pos: usize,
     /// Length of valid data
-    pub len: usize,
+    pub(crate) len: usize,
 }
 
 impl Buffer {
     /// Creates a new buffer with zeroed memory.
     ///
-    /// This allocates a `Vec<u8>` of the specified size and initializes it with zeros.
-    /// The allocation is eager (not lazy) - all memory is allocated immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::SizeTooBig`] if `size` exceeds [`BUF_MAX_SIZE`] (1GB).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    ///
-    /// let buf = Buffer::try_new(8192)?;
-    /// assert_eq!(buf.capacity(), 8192);
-    /// assert_eq!(buf.len(), 0);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    #[inline]
-    pub fn try_new(size: usize) -> Result<Self> {
-        if size > BUF_MAX_SIZE {
-            return Err(BufferError::SizeTooBig);
-        }
-        Ok(Self {
-            data: vec![0; size],
-            pos: 0,
-            len: 0,
-        })
-    }
-
-    /// Creates a new buffer with zeroed memory.
+    /// For large buffers (>4KB), the OS typically provides zero-filled pages
+    /// efficiently via demand paging, making this nearly as fast as uninitialized
+    /// allocation.
     ///
     /// # Panics
     ///
     /// Panics if `size` exceeds [`BUF_MAX_SIZE`] (1GB).
-    /// Prefer [`try_new`](Self::try_new) for fallible construction.
     ///
     /// # Examples
     ///
@@ -142,21 +62,32 @@ impl Buffer {
     ///
     /// let buf = Buffer::new(8192);
     /// assert_eq!(buf.capacity(), 8192);
+    /// assert_eq!(buf.len(), 0);
     /// ```
     #[inline]
     pub fn new(size: usize) -> Self {
-        Self::try_new(size).expect("Buffer size exceeds maximum")
+        assert!(
+            size <= BUF_MAX_SIZE,
+            "Buffer size {} exceeds maximum {}",
+            size,
+            BUF_MAX_SIZE
+        );
+        Self {
+            data: vec![0; size],
+            pos: 0,
+            len: 0,
+        }
     }
 
     /// Creates a new buffer with pre-allocated capacity but zero length.
     ///
-    /// The internal `Vec` is allocated with the specified capacity but has zero length.
-    /// You must call [`set_len`](Self::set_len) or use write operations to extend the
-    /// valid data region.
+    /// This is more efficient than [`new`](Self::new) when you know the maximum
+    /// size but want to grow the buffer incrementally. The internal `Vec` will
+    /// only be zeroed for the portions actually used.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`BufferError::SizeTooBig`] if `capacity` exceeds [`BUF_MAX_SIZE`] (1GB).
+    /// Panics if `capacity` exceeds [`BUF_MAX_SIZE`] (1GB).
     ///
     /// # Examples
     ///
@@ -164,41 +95,24 @@ impl Buffer {
     /// use secbuf::Buffer;
     /// # use secbuf::BufferError;
     ///
-    /// let mut buf = Buffer::try_with_capacity(8192)?;
+    /// let mut buf = Buffer::with_capacity(8192);
     /// assert_eq!(buf.capacity(), 8192);
     /// assert_eq!(buf.len(), 0);
-    ///
-    /// // Must set length before writing to ensure capacity exists
-    /// buf.set_len(100)?;
-    /// buf.set_pos(0)?;
-    /// buf.put_u32(42)?;
-    /// assert_eq!(buf.len(), 100);
     /// # Ok::<(), BufferError>(())
     /// ```
     #[inline]
-    pub fn try_with_capacity(capacity: usize) -> Result<Self> {
-        if capacity > BUF_MAX_SIZE {
-            return Err(BufferError::SizeTooBig);
-        }
-        let mut data = vec![0; capacity];
-        // Initialize to capacity with zeros so the memory exists
-        data.resize(capacity, 0);
-        Ok(Self {
-            data,
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            capacity <= BUF_MAX_SIZE,
+            "Buffer capacity {} exceeds maximum {}",
+            capacity,
+            BUF_MAX_SIZE
+        );
+        Self {
+            data: Vec::with_capacity(capacity),
             pos: 0,
             len: 0,
-        })
-    }
-
-    /// Creates a new buffer with pre-allocated capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `capacity` exceeds [`BUF_MAX_SIZE`] (1GB).
-    /// Prefer [`try_with_capacity`](Self::try_with_capacity) for fallible construction.
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self::try_with_capacity(capacity).expect("Buffer capacity exceeds maximum")
+        }
     }
 
     /// Creates a new buffer from existing data.
@@ -370,9 +284,12 @@ impl Buffer {
 
     /// Sets the length of valid data.
     ///
+    /// When using [`with_capacity`](Self::with_capacity), this will grow the
+    /// internal `Vec` if needed.
+    ///
     /// # Errors
     ///
-    /// Returns [`BufferError::PositionOutOfBounds`] if `len` exceeds buffer capacity.
+    /// Returns [`BufferError::SizeTooBig`] if `len` exceeds [`BUF_MAX_SIZE`].
     ///
     /// # Examples
     ///
@@ -380,140 +297,32 @@ impl Buffer {
     /// use secbuf::Buffer;
     /// # use secbuf::BufferError;
     ///
-    /// let mut buf = Buffer::new(1024);
+    /// let mut buf = Buffer::with_capacity(1024);
     /// buf.set_len(100)?;
     /// assert_eq!(buf.len(), 100);
     /// # Ok::<(), BufferError>(())
     /// ```
-    #[inline]
     pub fn set_len(&mut self, len: usize) -> Result<()> {
+        if len > BUF_MAX_SIZE {
+            return Err(BufferError::SizeTooBig);
+        }
+
+        // Grow Vec if needed (for with_capacity() usage)
         if len > self.data.len() {
-            return Err(BufferError::PositionOutOfBounds);
+            self.data.resize(len, 0);
         }
+
         self.len = len;
+        self.pos = self.pos.min(len);
         Ok(())
     }
 
-    /// Increments the position by `n` bytes.
+    /// Increments the position by `incr`.
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::IncrementTooLarge`] if `n` exceeds max increment.
-    /// Returns [`BufferError::PositionOutOfBounds`] if new position exceeds length.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(1024);
-    /// buf.put_u32(42)?;
-    /// buf.set_pos(0)?;
-    /// buf.incr_pos(4)?;
-    /// assert_eq!(buf.pos(), 4);
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    #[inline]
-    pub fn incr_pos(&mut self, n: usize) -> Result<()> {
-        if n > BUF_MAX_INCR {
-            return Err(BufferError::IncrementTooLarge);
-        }
-        let new_pos = self.pos.saturating_add(n);
-        if new_pos > self.len {
-            return Err(BufferError::PositionOutOfBounds);
-        }
-        self.pos = new_pos;
-        Ok(())
-    }
-
-    /// Increments the length by `n` bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::IncrementTooLarge`] if `n` exceeds max increment.
-    /// Returns [`BufferError::PositionOutOfBounds`] if new length exceeds capacity.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(1024);
-    /// buf.incr_len(100)?;
-    /// assert_eq!(buf.len(), 100);
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    #[inline]
-    pub fn incr_len(&mut self, n: usize) -> Result<()> {
-        if n > BUF_MAX_INCR {
-            return Err(BufferError::IncrementTooLarge);
-        }
-        let new_len = self.len.saturating_add(n);
-        if new_len > self.data.len() {
-            return Err(BufferError::PositionOutOfBounds);
-        }
-        self.len = new_len;
-        Ok(())
-    }
-
-    /// Increments the write position (alias for `incr_len`).
-    ///
-    /// This is typically called after using [`get_write_ptr`](Self::get_write_ptr)
-    /// to write data directly.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(1024);
-    /// let write_slice = buf.get_write_ptr(100)?;
-    /// // ... fill write_slice with data ...
-    /// buf.incr_write_pos(100)?;
-    /// assert_eq!(buf.len(), 100);
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    #[inline]
-    pub fn incr_write_pos(&mut self, n: usize) -> Result<()> {
-        self.incr_len(n)
-    }
-
-    /// Resets position and length to zero without zeroing memory.
-    ///
-    /// Use this for buffer reuse when the old data doesn't need to be
-    /// securely erased. For secure erasure, use [`burn`](Self::burn).
-    ///
-    /// # Performance
-    ///
-    /// This is the fastest reset method as it only updates metadata.
-    /// Memory contents remain but will be overwritten on next write.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(1024);
-    /// buf.put_u32(42)?;
-    /// buf.reset();
-    /// assert_eq!(buf.pos(), 0);
-    /// assert_eq!(buf.len(), 0);
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    #[inline]
-    pub fn reset(&mut self) {
-        self.pos = 0;
-        self.len = 0;
-    }
-
-    /// Resets position and length to zero without zeroing memory.
-    ///
-    /// Convenience alias for [`reset`](Self::reset) that matches common
-    /// collection API patterns.
+    /// Returns [`BufferError::IncrementTooLarge`] if the increment is too large
+    /// or would exceed the buffer length.
     ///
     /// # Examples
     ///
@@ -523,20 +332,135 @@ impl Buffer {
     ///
     /// let mut buf = Buffer::new(1024);
     /// buf.put_bytes(b"hello")?;
-    /// buf.clear();
-    /// assert!(buf.is_empty());
+    /// buf.set_pos(0)?;
+    ///
+    /// buf.incr_pos(2)?;
+    /// assert_eq!(buf.pos(), 2);
+    /// # Ok::<(), BufferError>(())
+    /// ```
+    pub fn incr_pos(&mut self, incr: usize) -> Result<()> {
+        if incr > BUF_MAX_INCR || self.pos + incr > self.len {
+            return Err(BufferError::IncrementTooLarge);
+        }
+        self.pos += incr;
+        Ok(())
+    }
+
+    /// Decrements the position by `decr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::PositionOutOfBounds`] if `decr` exceeds the current position.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use secbuf::Buffer;
+    /// # use secbuf::BufferError;
+    ///
+    /// let mut buf = Buffer::new(1024);
+    /// buf.put_u32(42)?;
+    ///
+    /// buf.decr_pos(2)?;
+    /// assert_eq!(buf.pos(), 2);
+    /// # Ok::<(), BufferError>(())
+    /// ```
+    pub fn decr_pos(&mut self, decr: usize) -> Result<()> {
+        if decr > self.pos {
+            return Err(BufferError::PositionOutOfBounds);
+        }
+        self.pos -= decr;
+        Ok(())
+    }
+
+    /// Increments the length by `incr`.
+    ///
+    /// When using [`with_capacity`](Self::with_capacity), this will grow the
+    /// internal `Vec` if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::IncrementTooLarge`] if the increment is too large.
+    /// Returns [`BufferError::SizeTooBig`] if the new length would exceed [`BUF_MAX_SIZE`].
+    pub fn incr_len(&mut self, incr: usize) -> Result<()> {
+        if incr > BUF_MAX_INCR {
+            return Err(BufferError::IncrementTooLarge);
+        }
+
+        let new_len = self.len + incr;
+        if new_len > BUF_MAX_SIZE {
+            return Err(BufferError::SizeTooBig);
+        }
+
+        // Grow Vec if needed
+        if new_len > self.data.len() {
+            self.data.resize(new_len, 0);
+        }
+
+        self.len = new_len;
+        Ok(())
+    }
+
+    /// Increments the write position and updates length if needed.
+    ///
+    /// When using [`with_capacity`](Self::with_capacity), this will grow the
+    /// internal `Vec` if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::IncrementTooLarge`] if the increment is too large
+    /// or the new position would exceed [`BUF_MAX_SIZE`].
+    pub fn incr_write_pos(&mut self, incr: usize) -> Result<()> {
+        if incr > BUF_MAX_INCR {
+            return Err(BufferError::IncrementTooLarge);
+        }
+
+        let new_pos = self.pos + incr;
+        if new_pos > BUF_MAX_SIZE {
+            return Err(BufferError::IncrementTooLarge);
+        }
+
+        // Grow Vec if needed
+        if new_pos > self.data.len() {
+            self.data.resize(new_pos, 0);
+        }
+
+        self.pos = new_pos;
+        if self.pos > self.len {
+            self.len = self.pos;
+        }
+        Ok(())
+    }
+
+    /// Resets the buffer for reuse by clearing position and length.
+    ///
+    /// This does not free memory or zero the contents. Use [`burn`](Self::burn)
+    /// for secure erasure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use secbuf::Buffer;
+    /// # use secbuf::BufferError;
+    ///
+    /// let mut buf = Buffer::new(1024);
+    /// buf.put_u32(42)?;
+    /// assert_eq!(buf.len(), 4);
+    ///
+    /// buf.reset();
+    /// assert_eq!(buf.len(), 0);
+    /// assert_eq!(buf.pos(), 0);
     /// # Ok::<(), BufferError>(())
     /// ```
     #[inline]
-    pub fn clear(&mut self) {
-        self.reset()
+    pub fn reset(&mut self) {
+        self.pos = 0;
+        self.len = 0;
     }
 
     /// Securely zeros all buffer memory and resets position and length.
     ///
     /// Uses compiler-resistant zeroing via the [`zeroize`] crate.
-    /// Use this when the buffer contains sensitive data that must be
-    /// cleared before reuse or when security is more important than performance.
     ///
     /// # Examples
     ///
@@ -574,216 +498,6 @@ impl Buffer {
     pub fn burn_free(mut self) {
         self.data.zeroize();
         drop(self);
-    }
-
-    /// Aggressive cleanup: zeros memory AND shrinks capacity to zero.
-    ///
-    /// Use when buffer won't be reused and you want to free memory immediately.
-    /// This is more aggressive than [`burn`](Self::burn) which keeps capacity.
-    ///
-    /// # Use Cases
-    ///
-    /// - Connection termination in long-running services
-    /// - Memory pressure situations
-    /// - One-time buffer usage
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(8192);
-    /// buf.put_bytes(b"data")?;
-    ///
-    /// buf.burn_and_free_memory();
-    ///
-    /// assert_eq!(buf.len(), 0);
-    /// assert_eq!(buf.capacity(), 0); // Memory freed
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    pub fn burn_and_free_memory(&mut self) {
-        self.data.zeroize();
-        self.data.clear();
-        self.data.shrink_to_fit();
-        self.pos = 0;
-        self.len = 0;
-    }
-
-    /// Resets and aggressively shrinks if capacity is much larger than needed.
-    ///
-    /// Useful for long-lived buffers that had temporary spikes. This method
-    /// intelligently shrinks only when wasteful (capacity >4x target AND >8KB).
-    ///
-    /// # Parameters
-    ///
-    /// - `target_size`: Desired capacity after shrinking
-    ///
-    /// # Shrinking Criteria
-    ///
-    /// Shrinks if:
-    /// - capacity > target_size * 4 AND
-    /// - capacity > 8192 bytes
-    ///
-    /// # Use Cases
-    ///
-    /// - Periodic cleanup in idle connections
-    /// - After processing large messages
-    /// - Memory pressure mitigation
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(65536); // 64KB
-    /// buf.put_bytes(b"small")?;
-    ///
-    /// // Shrinks because 64KB >> 1KB * 4
-    /// buf.reset_and_trim(1024);
-    ///
-    /// assert!(buf.capacity() <= 4096);
-    /// assert_eq!(buf.len(), 0);
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    pub fn reset_and_trim(&mut self, target_size: usize) {
-        self.reset();
-
-        let cap = self.data.capacity();
-        let should_shrink = cap > target_size * 4 && cap > 8192;
-
-        if should_shrink {
-            // Zero current data first
-            self.data.zeroize();
-
-            // Resize to target
-            self.data.resize(target_size, 0);
-            self.data.shrink_to_fit();
-        }
-    }
-
-    /// Aggressive shrink: zeros everything and shrinks to minimal size.
-    ///
-    /// Forces capacity reduction regardless of current usage. Use when
-    /// memory pressure is detected or buffer won't be used for a while.
-    ///
-    /// # Parameters
-    ///
-    /// - `keep_size`: Bytes of capacity to retain (0 = free all)
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(8192);
-    /// buf.put_bytes(b"data")?;
-    ///
-    /// // Free all memory
-    /// buf.aggressive_shrink(0);
-    /// assert_eq!(buf.capacity(), 0);
-    ///
-    /// // Or keep minimal capacity
-    /// let mut buf2 = Buffer::new(8192);
-    /// buf2.aggressive_shrink(1024);
-    /// assert_eq!(buf2.capacity(), 1024);
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    pub fn aggressive_shrink(&mut self, keep_size: usize) {
-        // Zero all data
-        self.data.zeroize();
-
-        // Reset state
-        self.pos = 0;
-        self.len = 0;
-
-        // Shrink to requested size
-        if keep_size == 0 {
-            self.data.clear();
-            self.data.shrink_to_fit();
-        } else {
-            self.data.resize(keep_size, 0);
-            self.data.shrink_to_fit();
-        }
-    }
-
-    /// Checks if buffer capacity is wasteful compared to usage.
-    ///
-    /// Returns `true` if capacity is >4x larger than length AND >8KB.
-    /// Use this to detect buffers that should be shrunk.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(65536); // 64KB
-    /// buf.put_bytes(b"tiny")?;
-    ///
-    /// assert!(buf.is_wasteful()); // 64KB for 4 bytes is wasteful
-    ///
-    /// let mut buf2 = Buffer::new(1024);
-    /// buf2.put_bytes(&vec![0u8; 1000])?;
-    ///
-    /// assert!(!buf2.is_wasteful()); // Good ratio
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    pub fn is_wasteful(&self) -> bool {
-        let cap = self.data.capacity();
-        cap > self.len * 4 && cap > 8192
-    }
-
-    /// Returns memory overhead in bytes (capacity - length).
-    ///
-    /// This is the amount of allocated but unused memory. High overhead
-    /// indicates opportunities for shrinking.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    /// # use secbuf::BufferError;
-    ///
-    /// let mut buf = Buffer::new(1024);
-    /// assert_eq!(buf.memory_overhead(), 1024); // All overhead
-    ///
-    /// buf.put_bytes(&vec![0u8; 512])?;
-    /// assert_eq!(buf.memory_overhead(), 512); // Half overhead
-    /// # Ok::<(), BufferError>(())
-    /// ```
-    pub fn memory_overhead(&self) -> usize {
-        self.data.capacity().saturating_sub(self.len)
-    }
-
-    /// Creates an explicit, unsecure clone of this buffer.
-    ///
-    /// This creates a deep copy of the buffer data. Use with caution as it
-    /// creates additional copies of potentially sensitive data that must be
-    /// separately managed.
-    ///
-    /// # Security Warning
-    ///
-    /// The cloned buffer is independent and will be zeroed separately on drop.
-    /// Ensure you track all clones properly to avoid leaving sensitive data in memory.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::Buffer;
-    ///
-    /// let buf1 = Buffer::new(1024);
-    /// let buf2 = buf1.clone_unsecure();
-    /// assert_eq!(buf1.capacity(), buf2.capacity());
-    /// ```
-    pub fn clone_unsecure(&self) -> Self {
-        Self {
-            data: self.data.clone(),
-            pos: self.pos,
-            len: self.len,
-        }
     }
 
     /// Returns a slice of all valid data in the buffer.
@@ -825,8 +539,6 @@ impl Buffer {
 
     /// Resizes the buffer, preserving existing data.
     ///
-    /// If shrinking, data beyond `new_size` is securely zeroed before release.
-    ///
     /// # Errors
     ///
     /// Returns [`BufferError::SizeTooBig`] if `new_size` exceeds [`BUF_MAX_SIZE`].
@@ -846,12 +558,6 @@ impl Buffer {
         if new_size > BUF_MAX_SIZE {
             return Err(BufferError::SizeTooBig);
         }
-
-        // If shrinking, zero the memory being released
-        if new_size < self.data.len() {
-            self.data[new_size..].zeroize();
-        }
-
         self.data.resize(new_size, 0);
         self.len = self.len.min(new_size);
         self.pos = self.pos.min(new_size);
@@ -878,7 +584,7 @@ impl Buffer {
 
     /// Shrinks the buffer capacity to fit the current length.
     ///
-    /// Frees unused memory. Data being released is securely zeroed.
+    /// Frees unused memory.
     ///
     /// # Examples
     ///
@@ -894,11 +600,6 @@ impl Buffer {
     /// ```
     #[inline]
     pub fn shrink_to_fit(&mut self) {
-        // Zero unused portion before shrinking
-        if self.len < self.data.len() {
-            self.data[self.len..].zeroize();
-        }
-
         self.data.truncate(self.len);
         self.data.shrink_to_fit();
     }
@@ -915,85 +616,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_burn_and_free_memory() {
-        let mut buf = Buffer::new(1024);
-        buf.put_bytes(b"sensitive").unwrap();
-
-        let initial_cap = buf.capacity();
-        assert_eq!(initial_cap, 1024);
-
-        buf.burn_and_free_memory();
-
-        assert_eq!(buf.len(), 0);
-        assert_eq!(buf.capacity(), 0);
-    }
-
-    #[test]
-    fn test_reset_and_trim() {
-        let mut buf = Buffer::new(65536); // 64KB
-        buf.put_bytes(b"small").unwrap();
-
-        // Should shrink because capacity (64KB) > target (1KB) * 4
-        buf.reset_and_trim(1024);
-
-        assert!(buf.capacity() <= 4096); // Should be trimmed
-        assert_eq!(buf.len(), 0);
-    }
-
-    #[test]
-    fn test_reset_and_trim_no_shrink() {
-        let mut buf = Buffer::new(4096); // 4KB
-        buf.put_bytes(b"data").unwrap();
-
-        // Should NOT shrink because capacity is close to target
-        buf.reset_and_trim(2048);
-
-        assert_eq!(buf.capacity(), 4096); // Unchanged
-    }
-
-    #[test]
-    fn test_is_wasteful() {
-        // Empty buffer with large capacity is wasteful
-        let buf = Buffer::new(65536); // 64KB
-        assert!(buf.is_wasteful()); // Changed: empty buffer IS wasteful
-
-        let mut buf = Buffer::new(65536);
-        buf.put_bytes(b"tiny").unwrap();
-        assert!(buf.is_wasteful()); // 64KB for 4 bytes is wasteful
-
-        let mut buf2 = Buffer::new(1024);
-        buf2.put_bytes(&vec![0u8; 1000]).unwrap();
-        assert!(!buf2.is_wasteful()); // Good ratio
-    }
-
-    #[test]
-    fn test_aggressive_shrink() {
-        let mut buf = Buffer::new(8192);
-        buf.put_bytes(b"data").unwrap();
-
-        buf.aggressive_shrink(0);
-
-        assert_eq!(buf.len(), 0);
-        assert_eq!(buf.capacity(), 0);
-    }
-
-    #[test]
-    fn test_aggressive_shrink_keep_size() {
-        let mut buf = Buffer::new(8192);
-        buf.put_bytes(b"data").unwrap();
-
-        buf.aggressive_shrink(1024);
-
-        assert_eq!(buf.len(), 0);
+    fn test_new() {
+        let buf = Buffer::new(1024);
         assert_eq!(buf.capacity(), 1024);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.pos(), 0);
     }
 
     #[test]
-    fn test_memory_overhead() {
-        let mut buf = Buffer::new(1024);
-        assert_eq!(buf.memory_overhead(), 1024); // All overhead
+    fn test_with_capacity() {
+        let mut buf = Buffer::with_capacity(1024);
+        assert_eq!(buf.capacity(), 1024);
+        assert_eq!(buf.len(), 0);
 
-        buf.put_bytes(&vec![0u8; 512]).unwrap();
-        assert_eq!(buf.memory_overhead(), 512); // Half overhead
+        buf.data.extend_from_slice(b"hello");
+        buf.len = 5;
+
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn test_from_vec() {
+        let data = vec![1, 2, 3, 4, 5];
+        let buf = Buffer::from_vec(data);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.as_slice(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_incr_len_grows_vec() {
+        let mut buf = Buffer::with_capacity(100);
+
+        buf.incr_len(50).unwrap();
+        assert_eq!(buf.len(), 50);
+        assert!(buf.data.len() >= 50);
+    }
+
+    #[test]
+    fn test_shrink_to_fit() {
+        let mut buf = Buffer::new(1024);
+        buf.len = 100;
+
+        buf.shrink_to_fit();
+        assert_eq!(buf.data.len(), 100);
+        assert_eq!(buf.len(), 100);
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut buf = Buffer::new(1024);
+        buf.pos = 50;
+        buf.len = 100;
+
+        buf.reset();
+        assert_eq!(buf.pos(), 0);
+        assert_eq!(buf.len(), 0);
     }
 }

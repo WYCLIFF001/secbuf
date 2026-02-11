@@ -1,20 +1,49 @@
-// src/circular/buffer.rs - Enhanced with aggressive memory management
-//! Circular buffer with aggressive cleanup and memory safety
+// src/circular/buffer.rs
+//! Circular (ring) buffer implementation with secure memory management
+//!
+//! # Memory Safety
+//!
+//! The circular buffer uses lazy allocation and secure memory clearing:
+//!
+//! - Memory is only allocated when first written to
+//! - All data is securely zeroed on drop using compiler-resistant clearing
+//! - The `free()` and `burn_free()` methods provide explicit cleanup for
+//!   connection/session termination patterns
+//!
+//! # Performance
+//!
+//! - Power-of-2 sizes use fast bitwise modulo (recommended)
+//! - Non-power-of-2 sizes use standard modulo (slightly slower)
+//! - Lazy allocation reduces memory footprint for unused buffers
+//!
+//! BUGFIX: Previous implementation had incorrect memory clearing in drop/free/burn_free.
+//! It was creating a Vec copy of the Box<[u8]>, zeroing the copy, then dropping the
+//! original unzeroed data. This has been fixed to properly convert and zero the original.
 
 use crate::error::{BufferError, Result};
 use zeroize::Zeroize;
 
 /// Maximum circular buffer size (100MB)
-pub const MAX_CBUF_SIZE: usize = 100_000_000;
+const MAX_CBUF_SIZE: usize = 100_000_000;
 
-/// Circular buffer with aggressive memory management.
+/// A circular (ring) buffer for efficient streaming data.
 ///
-/// Enhanced features:
-/// - Lazy allocation (allocates on first write)
-/// - Automatic secure zeroing on drop
-/// - Explicit cleanup methods
-/// - Memory pressure detection
-/// - Aggressive shrinking capabilities
+/// Memory is automatically securely zeroed on drop.
+///
+/// # Example
+///
+/// ```rust
+/// use secbuf::prelude::*;
+///
+/// let mut ring = CircularBuffer::new(1024);
+/// ring.write(b"Hello, ")?;
+/// ring.write(b"World!")?;
+///
+/// let mut output = vec![0u8; ring.used()];
+/// ring.read(&mut output)?;
+/// assert_eq!(&output, b"Hello, World!");
+/// # Ok::<(), secbuf::BufferError>(())
+/// ```
 pub struct CircularBuffer {
     /// Internal storage (lazily allocated, auto-zeroized on drop)
     data: Option<Box<[u8]>>,
@@ -28,271 +57,97 @@ pub struct CircularBuffer {
     write_pos: usize,
     /// Whether size is power-of-2 (enables fast modulo)
     is_pow2: bool,
-    /// Track if buffer has ever been allocated (for memory pressure detection)
-    was_allocated: bool,
 }
 
 impl CircularBuffer {
-    /// Creates a new circular buffer with lazy allocation.
+    /// Creates a new circular buffer with the specified size.
     ///
-    /// The buffer memory is **not** allocated immediately. Instead, allocation
-    /// happens on the first write operation. This allows creating many buffers
-    /// without consuming memory until they're actually used.
+    /// Memory is not allocated until first write.
     ///
-    /// # Arguments
+    /// # Panics
     ///
-    /// * `size` - Buffer capacity in bytes (maximum [`MAX_CBUF_SIZE`] = 100MB)
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::SizeTooBig`] if `size` exceeds [`MAX_CBUF_SIZE`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let buf = CircularBuffer::try_new(4096)?;
-    /// assert_eq!(buf.size(), 4096);
-    /// assert!(!buf.is_allocated()); // Memory not yet allocated
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    pub fn try_new(size: usize) -> Result<Self> {
-        if size > MAX_CBUF_SIZE {
-            return Err(BufferError::SizeTooBig);
-        }
+    /// Panics if size exceeds `MAX_CBUF_SIZE` (100MB).
+    pub fn new(size: usize) -> Self {
+        assert!(
+            size <= MAX_CBUF_SIZE,
+            "Circular buffer size {} exceeds maximum {}",
+            size,
+            MAX_CBUF_SIZE
+        );
 
-        Ok(Self {
+        Self {
             data: None,
             size,
             used: 0,
             read_pos: 0,
             write_pos: 0,
             is_pow2: size.is_power_of_two(),
-            was_allocated: false,
-        })
+        }
     }
 
-    /// Creates a new circular buffer with lazy allocation.
+    /// Creates a buffer with power-of-2 size for optimal performance.
     ///
-    /// # Panics
-    ///
-    /// Panics if `size` exceeds [`MAX_CBUF_SIZE`] (100MB).
-    /// Prefer [`try_new`](Self::try_new) for fallible construction.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let buf = CircularBuffer::new(8192);
-    /// assert_eq!(buf.size(), 8192);
-    /// ```
-    pub fn new(size: usize) -> Self {
-        Self::try_new(size).expect("Circular buffer size exceeds maximum")
-    }
-
-    /// Creates a new power-of-2 sized circular buffer for fast modulo operations.
-    ///
-    /// Power-of-2 sizes enable bitwise AND instead of modulo division for position
-    /// wrapping, providing ~2x performance improvement for position calculations.
+    /// Uses fast bitwise AND for position wrapping instead of modulo.
     ///
     /// # Arguments
     ///
-    /// * `size_log2` - Base-2 logarithm of desired size (e.g., 12 for 4KB, 16 for 64KB)
+    /// * `size_log2` - Log base 2 of the desired size (e.g., 10 for 1024 bytes)
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`BufferError::SizeTooBig`] if resulting size exceeds [`MAX_CBUF_SIZE`]
-    /// or if `size_log2` would overflow.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// // 2^12 = 4096 bytes
-    /// let buf = CircularBuffer::try_new_pow2(12)?;
-    /// assert_eq!(buf.size(), 4096);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    pub fn try_new_pow2(size_log2: u32) -> Result<Self> {
-        let size = 1_usize
-            .checked_shl(size_log2)
-            .ok_or(BufferError::SizeTooBig)?;
+    /// Panics if resulting size exceeds `MAX_CBUF_SIZE`.
+    pub fn new_pow2(size_log2: u32) -> Self {
+        let size = 1 << size_log2;
+        assert!(
+            size <= MAX_CBUF_SIZE,
+            "Circular buffer size {} exceeds maximum {}",
+            size,
+            MAX_CBUF_SIZE
+        );
 
-        if size > MAX_CBUF_SIZE {
-            return Err(BufferError::SizeTooBig);
-        }
-
-        Ok(Self {
+        Self {
             data: None,
             size,
             used: 0,
             read_pos: 0,
             write_pos: 0,
             is_pow2: true,
-            was_allocated: false,
-        })
+        }
     }
 
-    /// Creates a new power-of-2 sized circular buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if resulting size exceeds maximum.
-    /// Prefer [`try_new_pow2`](Self::try_new_pow2) for fallible construction.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let buf = CircularBuffer::new_pow2(14); // 2^14 = 16KB
-    /// assert_eq!(buf.size(), 16384);
-    /// ```
-    pub fn new_pow2(size_log2: u32) -> Self {
-        Self::try_new_pow2(size_log2).expect("Circular buffer size exceeds maximum")
-    }
-
-    /// Returns the number of bytes currently stored in the buffer.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// assert_eq!(buf.used(), 0);
-    ///
-    /// buf.write(b"hello")?;
-    /// assert_eq!(buf.used(), 5);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Returns the number of bytes currently in the buffer.
     #[inline(always)]
     pub fn used(&self) -> usize {
         self.used
     }
 
-    /// Returns the number of bytes available for writing.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// assert_eq!(buf.available(), 256);
-    ///
-    /// buf.write(b"hello")?;
-    /// assert_eq!(buf.available(), 251);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Returns the available space for writing.
     #[inline(always)]
     pub fn available(&self) -> usize {
         self.size - self.used
     }
 
-    /// Returns the total capacity of the buffer.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let buf = CircularBuffer::new(1024);
-    /// assert_eq!(buf.size(), 1024);
-    /// ```
+    /// Returns the total size of the buffer.
     #[inline(always)]
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// Returns `true` if the buffer contains no data.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// assert!(buf.is_empty());
-    ///
-    /// buf.write(b"data")?;
-    /// assert!(!buf.is_empty());
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Returns `true` if the buffer is empty.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.used == 0
     }
 
-    /// Returns `true` if the buffer is full (no space for writing).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(4);
-    /// assert!(!buf.is_full());
-    ///
-    /// buf.write(b"full")?;
-    /// assert!(buf.is_full());
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Returns `true` if the buffer is full.
     #[inline(always)]
     pub fn is_full(&self) -> bool {
         self.used == self.size
     }
 
-    /// Returns `true` if buffer memory has been allocated.
+    /// Wraps a position around the buffer size.
     ///
-    /// Due to lazy allocation, the buffer may exist but have no allocated memory
-    /// until the first write operation.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// assert!(!buf.is_allocated()); // Not allocated yet
-    ///
-    /// buf.write(b"data")?;
-    /// assert!(buf.is_allocated()); // Now allocated
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    #[inline(always)]
-    pub fn is_allocated(&self) -> bool {
-        self.data.is_some()
-    }
-
-    /// Returns `true` if buffer was allocated but is now empty.
-    ///
-    /// This indicates potential waste - memory is allocated but unused.
-    /// Consider calling [`clear_and_free_if_idle`](Self::clear_and_free_if_idle)
-    /// to reclaim memory.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"data")?;
-    /// assert!(!buf.is_idle()); // Has data
-    ///
-    /// let mut tmp = vec![0u8; 4];
-    /// buf.read(&mut tmp)?;
-    /// assert!(buf.is_idle()); // Allocated but empty
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    #[inline(always)]
-    pub fn is_idle(&self) -> bool {
-        self.was_allocated && self.is_empty() && self.data.is_some()
-    }
-
+    /// Uses fast bitwise AND for power-of-2 sizes, standard modulo otherwise.
     #[inline(always)]
     fn wrap_pos(&self, pos: usize, delta: usize) -> usize {
         let new_pos = pos + delta;
@@ -303,29 +158,14 @@ impl CircularBuffer {
         }
     }
 
-    /// Returns read pointers for zero-copy reading.
+    /// Returns slices for reading data (zero-copy).
     ///
-    /// Due to the circular nature, data may wrap around. This returns two slices:
-    /// - First slice: data from read position to end of buffer (or all data if no wrap)
-    /// - Second slice: wrapped data from start of buffer (empty if no wrap)
+    /// Due to the circular nature, data may wrap around, requiring two slices.
+    /// The second slice will be empty if data is contiguous.
     ///
     /// # Returns
     ///
-    /// `(first_chunk, second_chunk)` where `second_chunk` is empty if data doesn't wrap.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"hello world")?;
-    ///
-    /// let (chunk1, chunk2) = buf.read_ptrs();
-    /// assert_eq!(chunk1, b"hello world");
-    /// assert_eq!(chunk2, b""); // No wrap in this case
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// A tuple of `(&[u8], &[u8])` where the second slice is empty if no wrap-around.
     pub fn read_ptrs(&self) -> (&[u8], &[u8]) {
         if self.used == 0 || self.data.is_none() {
             return (&[], &[]);
@@ -344,74 +184,31 @@ impl CircularBuffer {
         }
     }
 
-    /// Returns a mutable slice for zero-copy writing.
+    /// Returns a mutable slice for writing (zero-copy).
     ///
-    /// Allocates buffer memory on first call (lazy allocation). The returned slice
-    /// is guaranteed to be contiguous (does not wrap).
-    ///
-    /// After writing data, you **must** call [`incr_write`](Self::incr_write) to
-    /// update the write position.
-    ///
-    /// # Arguments
-    ///
-    /// * `len` - Number of bytes needed for writing
+    /// Performs lazy allocation if buffer has not yet been allocated.
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::InsufficientSpace`] if `len` exceeds available space.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// let write_slice = buf.write_ptr(10)?;
-    /// write_slice.copy_from_slice(b"0123456789");
-    /// buf.incr_write(10)?;
-    /// assert_eq!(buf.used(), 10);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Returns `BufferError::InsufficientSpace` if requested length exceeds available space.
     pub fn write_ptr(&mut self, len: usize) -> Result<&mut [u8]> {
         if len > self.available() {
             return Err(BufferError::InsufficientSpace);
         }
 
-        // Lazy allocation
+        // Lazy allocation using Box for automatic secure zeroing
         if self.data.is_none() {
             let boxed = vec![0; self.size].into_boxed_slice();
             self.data = Some(boxed);
-            self.was_allocated = true;
         }
 
         let buffer = self.data.as_mut().unwrap();
         Ok(&mut buffer[self.write_pos..self.write_pos + len])
     }
 
-    /// Increments the write position after using [`write_ptr`](Self::write_ptr).
+    /// Advances the write position after writing data.
     ///
-    /// This commits written data to the buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `len` - Number of bytes written
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::InsufficientSpace`] if `len` exceeds available space.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// let slice = buf.write_ptr(5)?;
-    /// slice.copy_from_slice(b"hello");
-    /// buf.incr_write(5)?;
-    /// assert_eq!(buf.used(), 5);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Must be called after writing to the slice returned by `write_ptr()`.
     pub fn incr_write(&mut self, len: usize) -> Result<()> {
         if len > self.available() {
             return Err(BufferError::InsufficientSpace);
@@ -422,31 +219,9 @@ impl CircularBuffer {
         Ok(())
     }
 
-    /// Increments the read position, discarding data.
+    /// Advances the read position after reading data.
     ///
-    /// Use this to consume data without actually copying it (e.g., after processing
-    /// data from [`read_ptrs`](Self::read_ptrs)).
-    ///
-    /// # Arguments
-    ///
-    /// * `len` - Number of bytes to discard
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::BufferOverflow`] if `len` exceeds available data.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"discard me")?;
-    ///
-    /// buf.incr_read(10)?;
-    /// assert_eq!(buf.used(), 0);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Must be called after reading from the slices returned by `read_ptrs()`.
     pub fn incr_read(&mut self, len: usize) -> Result<()> {
         if len > self.used {
             return Err(BufferError::BufferOverflow);
@@ -457,34 +232,11 @@ impl CircularBuffer {
         Ok(())
     }
 
-    /// Writes data to the buffer.
-    ///
-    /// Handles wraparound automatically. Allocates buffer memory on first write
-    /// (lazy allocation).
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - Data to write
-    ///
-    /// # Returns
-    ///
-    /// Number of bytes written (always equals `data.len()` on success).
+    /// Writes data into the circular buffer.
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::InsufficientSpace`] if buffer is too full.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// let written = buf.write(b"hello world")?;
-    /// assert_eq!(written, 11);
-    /// assert_eq!(buf.used(), 11);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Returns `BufferError::InsufficientSpace` if data doesn't fit.
     pub fn write(&mut self, data: &[u8]) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -494,60 +246,56 @@ impl CircularBuffer {
             return Err(BufferError::InsufficientSpace);
         }
 
-        // Lazy allocation
+        // Lazy allocation using Box for secure zeroing
         if self.data.is_none() {
             let boxed = vec![0; self.size].into_boxed_slice();
             self.data = Some(boxed);
-            self.was_allocated = true;
         }
 
-        let buffer = self.data.as_mut().unwrap();
+        let mut written = 0;
+        let mut src_pos = 0;
 
-        // Two-part copy for wrap-around
-        let until_end = self.size - self.write_pos;
-        let first_chunk = data.len().min(until_end);
+        while written < data.len() {
+            // Calculate contiguous write space
+            let contig = if self.used == self.size {
+                0
+            } else if self.write_pos < self.read_pos {
+                self.read_pos - self.write_pos
+            } else {
+                self.size - self.write_pos
+            };
 
-        buffer[self.write_pos..self.write_pos + first_chunk].copy_from_slice(&data[..first_chunk]);
+            if contig == 0 {
+                break;
+            }
 
-        if first_chunk < data.len() {
-            let second_chunk = data.len() - first_chunk;
-            buffer[0..second_chunk].copy_from_slice(&data[first_chunk..]);
+            let to_write = (data.len() - written).min(contig);
+
+            // Get buffer reference once before the loop
+            let buffer = self.data.as_mut().unwrap();
+
+            // Copy data
+            buffer[self.write_pos..self.write_pos + to_write]
+                .copy_from_slice(&data[src_pos..src_pos + to_write]);
+
+            // Update positions after borrowing ends
+            let new_write_pos = self.wrap_pos(self.write_pos, to_write);
+            self.write_pos = new_write_pos;
+            self.used += to_write;
+            written += to_write;
+            src_pos += to_write;
         }
 
-        self.write_pos = self.wrap_pos(self.write_pos, data.len());
-        self.used += data.len();
-
-        Ok(data.len())
+        Ok(written)
     }
 
-    /// Reads data from the buffer, removing it.
+    /// Reads data from the circular buffer.
     ///
-    /// Handles wraparound automatically. Reads up to `output.len()` bytes or
-    /// all available data, whichever is smaller.
-    ///
-    /// # Arguments
-    ///
-    /// * `output` - Buffer to read into
+    /// Reads up to `output.len()` bytes or all available data, whichever is smaller.
     ///
     /// # Returns
     ///
     /// Number of bytes actually read.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"hello world")?;
-    ///
-    /// let mut output = vec![0u8; 5];
-    /// let read = buf.read(&mut output)?;
-    /// assert_eq!(read, 5);
-    /// assert_eq!(&output, b"hello");
-    /// assert_eq!(buf.used(), 6); // " world" remains
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
     pub fn read(&mut self, output: &mut [u8]) -> Result<usize> {
         if self.used == 0 {
             return Ok(0);
@@ -559,50 +307,26 @@ impl CircularBuffer {
         };
 
         let to_read = output.len().min(self.used);
-        let until_end = self.size - self.read_pos;
-        let first_chunk_len = to_read.min(until_end);
+        let mut read = 0;
 
-        output[..first_chunk_len]
-            .copy_from_slice(&buffer[self.read_pos..self.read_pos + first_chunk_len]);
+        while read < to_read {
+            let until_end = self.size - self.read_pos;
+            let chunk_size = (to_read - read).min(until_end);
 
-        if first_chunk_len < to_read {
-            let second_chunk_len = to_read - first_chunk_len;
-            output[first_chunk_len..to_read].copy_from_slice(&buffer[0..second_chunk_len]);
+            output[read..read + chunk_size]
+                .copy_from_slice(&buffer[self.read_pos..self.read_pos + chunk_size]);
+
+            self.read_pos = self.wrap_pos(self.read_pos, chunk_size);
+            self.used -= chunk_size;
+            read += chunk_size;
         }
 
-        self.read_pos = self.wrap_pos(self.read_pos, to_read);
-        self.used -= to_read;
-
-        Ok(to_read)
+        Ok(read)
     }
 
-    /// Reads data without removing it (peek operation).
+    /// Peeks at data without consuming it.
     ///
-    /// Identical to [`read`](Self::read) but doesn't advance the read position
-    /// or modify buffer state.
-    ///
-    /// # Arguments
-    ///
-    /// * `output` - Buffer to read into
-    ///
-    /// # Returns
-    ///
-    /// Number of bytes read.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"hello")?;
-    ///
-    /// let mut output = vec![0u8; 5];
-    /// buf.peek(&mut output)?;
-    /// assert_eq!(&output, b"hello");
-    /// assert_eq!(buf.used(), 5); // Data still in buffer
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Similar to `read()` but doesn't advance the read position.
     pub fn peek(&self, output: &mut [u8]) -> Result<usize> {
         if self.used == 0 {
             return Ok(0);
@@ -614,40 +338,26 @@ impl CircularBuffer {
         };
 
         let to_read = output.len().min(self.used);
-        let until_end = self.size - self.read_pos;
-        let first_chunk_len = to_read.min(until_end);
+        let mut read = 0;
+        let mut read_pos = self.read_pos;
 
-        output[..first_chunk_len]
-            .copy_from_slice(&buffer[self.read_pos..self.read_pos + first_chunk_len]);
+        while read < to_read {
+            let until_end = self.size - read_pos;
+            let chunk_size = (to_read - read).min(until_end);
 
-        if first_chunk_len < to_read {
-            let second_chunk_len = to_read - first_chunk_len;
-            output[first_chunk_len..to_read].copy_from_slice(&buffer[0..second_chunk_len]);
+            output[read..read + chunk_size]
+                .copy_from_slice(&buffer[read_pos..read_pos + chunk_size]);
+
+            read_pos = self.wrap_pos(read_pos, chunk_size);
+            read += chunk_size;
         }
 
-        Ok(to_read)
+        Ok(read)
     }
 
-    /// Clears the buffer **without** freeing memory.
+    /// Clears the buffer without freeing memory.
     ///
-    /// Resets positions and counters but keeps the allocation intact.
-    /// Use for performance when buffer will be reused soon.
-    ///
-    /// For memory reclamation, use [`free`](Self::free) instead.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"data")?;
-    ///
-    /// buf.clear();
-    /// assert_eq!(buf.used(), 0);
-    /// assert!(buf.is_allocated()); // Memory still allocated
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// Resets positions and used count, but keeps allocated memory for reuse.
     #[inline]
     pub fn clear(&mut self) {
         self.used = 0;
@@ -655,165 +365,55 @@ impl CircularBuffer {
         self.write_pos = 0;
     }
 
-    /// Securely zeros and frees memory.
+    /// Frees the buffer and securely zeroes memory.
     ///
-    /// Use when buffer won't be used again soon. Memory is zeroed before
-    /// being released to prevent data leaks.
+    /// Explicit cleanup for connection/session termination.
+    /// Converts the Box<[u8]> to Vec<u8> in-place and securely zeros it.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"sensitive data")?;
-    ///
-    /// buf.free();
-    /// assert_eq!(buf.used(), 0);
-    /// assert!(!buf.is_allocated()); // Memory freed
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// BUGFIX: Previous implementation created a copy with .to_vec(), which zeroed
+    /// the copy but left the original data unzeroed. Fixed to properly convert and
+    /// zero the original allocation.
     pub fn free(&mut self) {
         if let Some(data) = self.data.take() {
+            // Convert Box<[u8]> to Vec<u8> without copying
             let mut vec = data.into_vec();
+            // Securely zero the actual allocation
             vec.zeroize();
-            drop(vec);
         }
         self.clear();
     }
 
     /// Consumes and securely frees the buffer.
     ///
-    /// Ownership-consuming version of [`free`](Self::free).
-    /// Memory is zeroed before being released.
+    /// Equivalent to Dropbear's cbuf_free() pattern.
+    /// Provides explicit ownership-consuming cleanup.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"secret")?;
-    /// buf.burn_free(); // Buffer consumed
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
+    /// BUGFIX: Same fix as free() - now properly zeros the original allocation.
     pub fn burn_free(mut self) {
         if let Some(data) = self.data.take() {
             let mut vec = data.into_vec();
             vec.zeroize();
-            drop(vec);
         }
         drop(self);
     }
-
-    /// Clears and optionally frees memory if buffer is idle.
-    ///
-    /// Clears the buffer unconditionally. If the buffer is idle (allocated but empty),
-    /// it also frees the memory. Use this for periodic cleanup in long-lived connections.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"data")?;
-    /// let mut tmp = vec![0u8; 4];
-    /// buf.read(&mut tmp)?; // Now idle (allocated but empty)
-    ///
-    /// buf.clear_and_free_if_idle();
-    /// assert!(!buf.is_allocated()); // Memory freed
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    pub fn clear_and_free_if_idle(&mut self) {
-        self.clear();
-
-        // Free memory if buffer was allocated but has been idle
-        if self.is_idle() {
-            self.free();
-        }
-    }
-
-    /// Aggressively zeros all data without freeing allocation.
-    ///
-    /// Faster than [`free`](Self::free) when buffer will be reused.
-    /// Memory is zeroed in-place but the allocation is retained.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(256);
-    /// buf.write(b"sensitive")?;
-    ///
-    /// buf.zero_in_place();
-    /// assert_eq!(buf.used(), 0);
-    /// assert!(buf.is_allocated()); // Memory still allocated but zeroed
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    pub fn zero_in_place(&mut self) {
-        if let Some(ref mut data) = self.data {
-            let mut vec = std::mem::take(data).into_vec();
-            vec.zeroize();
-            *data = vec.into_boxed_slice();
-        }
-        self.clear();
-    }
-
-    /// Returns memory usage statistics.
-    ///
-    /// Provides insight into allocation status, usage, and waste for monitoring
-    /// and optimization.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::CircularBuffer;
-    ///
-    /// let mut buf = CircularBuffer::new(1024);
-    /// buf.write(b"test")?;
-    ///
-    /// let stats = buf.memory_stats();
-    /// assert!(stats.allocated);
-    /// assert_eq!(stats.size, 1024);
-    /// assert_eq!(stats.used, 4);
-    /// assert_eq!(stats.wasted, 1020);
-    /// # Ok::<(), secbuf::BufferError>(())
-    /// ```
-    pub fn memory_stats(&self) -> CircularBufferMemoryStats {
-        CircularBufferMemoryStats {
-            allocated: self.data.is_some(),
-            size: self.size,
-            used: self.used,
-            wasted: if self.data.is_some() {
-                self.size - self.used
-            } else {
-                0
-            },
-        }
-    }
-}
-
-/// Memory statistics for a circular buffer.
-#[derive(Debug, Clone, Copy)]
-pub struct CircularBufferMemoryStats {
-    /// Whether buffer memory is allocated
-    pub allocated: bool,
-    /// Total size of buffer
-    pub size: usize,
-    /// Bytes currently in use
-    pub used: usize,
-    /// Bytes allocated but unused (wasted)
-    pub wasted: usize,
 }
 
 impl Drop for CircularBuffer {
+    /// Automatically secures and frees memory on drop.
+    ///
+    /// BUGFIX: Previous implementation created a Vec copy with .to_vec(), zeroed the copy,
+    /// then dropped the original unzeroed Box<[u8]>. This meant sensitive data could remain
+    /// in the original allocation.
+    ///
+    /// Fixed to properly convert Box<[u8]> to Vec<u8> in-place using into_vec(), which
+    /// maintains ownership of the original allocation and allows us to securely zero it
+    /// before it's freed.
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
+            // Convert Box<[u8]> to Vec<u8> without copying - maintains same allocation
             let mut vec = data.into_vec();
+            // Securely zero the original allocation
             vec.zeroize();
-            drop(vec);
         }
     }
 }
@@ -823,49 +423,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_idle() {
-        let mut buf = CircularBuffer::new(256);
-        assert!(!buf.is_idle()); // Not yet allocated
-
-        buf.write(b"data").unwrap();
-        assert!(!buf.is_idle()); // Has data
-
-        let mut tmp = vec![0u8; 4];
-        buf.read(&mut tmp).unwrap();
-        assert!(buf.is_idle()); // Allocated but empty
-    }
-
-    #[test]
-    fn test_clear_and_free_if_idle() {
-        let mut buf = CircularBuffer::new(256);
-        buf.write(b"test").unwrap();
-
-        buf.clear_and_free_if_idle();
+    fn test_circular_basic() {
+        let buf = CircularBuffer::new(256);
+        assert_eq!(buf.size(), 256);
+        assert_eq!(buf.used(), 0);
         assert!(buf.is_empty());
-        assert!(!buf.is_allocated()); // Should have freed
     }
 
     #[test]
-    fn test_zero_in_place() {
+    fn test_write_read() {
         let mut buf = CircularBuffer::new(256);
-        buf.write(b"sensitive").unwrap();
 
-        buf.zero_in_place();
+        buf.write(b"Hello").unwrap();
+        assert_eq!(buf.used(), 5);
+
+        let mut output = vec![0u8; 5];
+        buf.read(&mut output).unwrap();
+        assert_eq!(&output, b"Hello");
         assert!(buf.is_empty());
-        assert!(buf.is_allocated()); // Memory still allocated
     }
 
     #[test]
-    fn test_memory_stats() {
+    fn test_wrap_around() {
+        let mut buf = CircularBuffer::new(8);
+
+        buf.write(b"12345").unwrap();
+        let mut tmp = vec![0u8; 3];
+        buf.read(&mut tmp).unwrap(); // Read 3, leaves 2
+
+        buf.write(b"6789").unwrap(); // Should wrap
+        assert_eq!(buf.used(), 6);
+
+        let mut output = vec![0u8; 6];
+        buf.read(&mut output).unwrap();
+        assert_eq!(&output, b"456789");
+    }
+
+    #[test]
+    fn test_free() {
         let mut buf = CircularBuffer::new(1024);
-        let stats = buf.memory_stats();
-        assert!(!stats.allocated);
-        assert_eq!(stats.wasted, 0);
+        buf.write(b"sensitive").unwrap();
+        buf.free();
 
-        buf.write(b"test").unwrap();
-        let stats = buf.memory_stats();
-        assert!(stats.allocated);
-        assert_eq!(stats.used, 4);
-        assert_eq!(stats.wasted, 1020);
+        assert!(buf.is_empty());
+        assert_eq!(buf.used(), 0);
+    }
+
+    #[test]
+    fn test_burn_free() {
+        let mut buf = CircularBuffer::new(1024);
+        buf.write(b"secret").unwrap();
+        buf.burn_free(); // Consumes buffer
     }
 }

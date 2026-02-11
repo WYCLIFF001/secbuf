@@ -1,8 +1,6 @@
 // tests/integration_tests.rs
 //! Integration tests for the buffer module
 
-use secbuf::buffer::core::BUF_MAX_SIZE;
-use secbuf::circular;
 use secbuf::prelude::*;
 
 #[test]
@@ -192,8 +190,7 @@ fn test_buffer_clone_independence() {
     let mut original = Buffer::new(100);
     original.put_u32(42).unwrap();
 
-    // FIXED: Use clone_unsecure() instead of .clone()
-    let mut cloned = original.clone_unsecure();
+    let mut cloned = original.clone();
     cloned.set_pos(0).unwrap();
     cloned.put_u32(99).unwrap();
 
@@ -320,65 +317,4 @@ fn test_fast_pool_concurrency() {
 
     let stats = pool.stats();
     assert_eq!(stats.acquired, 400);
-}
-
-// Additional tests for new fallible constructors
-#[test]
-fn test_try_new_constructors() {
-    // Test successful creation
-    let buf = Buffer::try_new(1024).unwrap();
-    assert_eq!(buf.capacity(), 1024);
-
-    // Test error on too large
-    let result = Buffer::try_new(BUF_MAX_SIZE + 1);
-    assert!(result.is_err());
-
-    // Test circular buffer
-    let cbuf = CircularBuffer::try_new(256).unwrap();
-    assert_eq!(cbuf.size(), 256);
-
-    let cbuf_result = CircularBuffer::try_new(circular::buffer::MAX_CBUF_SIZE + 1);
-    assert!(cbuf_result.is_err());
-}
-
-#[test]
-fn test_overflow_protection() {
-    let mut buf = Buffer::new(100);
-
-    // Test incr_len overflow protection with BUF_MAX_INCR
-    let result = buf.incr_len(BUF_MAX_SIZE + 1);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), BufferError::IncrementTooLarge);
-
-    // Test incr_pos overflow protection with BUF_MAX_INCR
-    let result = buf.incr_pos(BUF_MAX_SIZE + 1);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), BufferError::IncrementTooLarge);
-
-    // Test that incrementing beyond capacity fails
-    buf.set_len(50).unwrap();
-    let result = buf.incr_len(100); // Would exceed capacity of 100
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), BufferError::PositionOutOfBounds);
-
-    // Test that incrementing position beyond length fails
-    buf.set_pos(0).unwrap();
-    let result = buf.incr_pos(60); // Would exceed len of 50
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), BufferError::PositionOutOfBounds);
-}
-
-#[test]
-fn test_clone_unsecure_warning() {
-    // Test that clone_unsecure works but is explicit
-    let buf1 = Buffer::new(100);
-    let buf2 = buf1.clone_unsecure();
-
-    assert_eq!(buf1.capacity(), buf2.capacity());
-    assert_eq!(buf1.len(), buf2.len());
-
-    // Verify they are independent
-    drop(buf1);
-    // buf2 should still be valid
-    assert_eq!(buf2.capacity(), 100);
 }
