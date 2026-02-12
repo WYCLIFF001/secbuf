@@ -1,4 +1,3 @@
-// src/error.rs
 //! Error types for buffer operations with advanced conversion support
 
 use std::fmt;
@@ -62,13 +61,9 @@ impl From<BufferError> for std::io::Error {
             BufferError::BufferOverflow | BufferError::InsufficientSpace => {
                 std::io::Error::new(ErrorKind::WriteZero, err)
             }
-            BufferError::BufferEmpty => {
-                std::io::Error::new(ErrorKind::UnexpectedEof, err)
-            }
-            BufferError::Io(msg) => {
-                std::io::Error::new(ErrorKind::Other, msg)
-            }
-            _ => std::io::Error::new(ErrorKind::Other, err),
+            BufferError::BufferEmpty => std::io::Error::new(ErrorKind::UnexpectedEof, err),
+            BufferError::Io(msg) => std::io::Error::other(msg),
+            _ => std::io::Error::other(err),
         }
     }
 }
@@ -80,15 +75,11 @@ impl From<std::io::Error> for BufferError {
     }
 }
 
-/// Convert BufferError to anyhow::Error (for SSH handler compatibility)
-#[cfg(feature = "anyhow")]
-impl From<BufferError> for anyhow::Error {
-    fn from(err: BufferError) -> Self {
-        anyhow::anyhow!("{}", err)
-    }
-}
+// Note: BufferError -> anyhow::Error conversion is automatic via anyhow's
+// blanket From impl for types that implement std::error::Error + Send + Sync + 'static.
+// No explicit implementation needed.
 
-/// Allow using ? with anyhow::Error
+/// Allow converting anyhow::Error to BufferError for bi-directional compatibility
 #[cfg(feature = "anyhow")]
 impl From<anyhow::Error> for BufferError {
     fn from(err: anyhow::Error) -> Self {
@@ -138,7 +129,7 @@ impl<T> ResultExt<T> for Result<T> {
 /// Convenience macro for converting buffer operations to any Result type.
 ///
 /// Requires an explicit target error type as the second argument so the
-/// conversion is unambiguous â€” necessary because error types like
+/// conversion is unambiguous — necessary because error types like
 /// `anyhow::Error` have multiple overlapping `From` impls.
 ///
 /// # Example
@@ -197,6 +188,7 @@ mod tests {
     #[test]
     fn test_anyhow_conversion() {
         let buf_err = BufferError::InvalidString;
+        // anyhow conversion happens automatically via the blanket impl
         let anyhow_err: anyhow::Error = buf_err.into();
         assert!(anyhow_err.to_string().contains("Invalid string"));
     }
