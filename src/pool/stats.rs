@@ -76,7 +76,15 @@ pub struct FastPoolStats {
     pub returned: usize,
     /// Number of times a buffer was acquired from thread-local cache
     pub cache_hits: usize,
-    /// Number of buffers lost when threads exit with cached buffers
+    /// Number of buffers "lost" when threads exit with cached buffers.
+    ///
+    /// **Always 0 in the current implementation.**
+    /// The previous `ThreadCacheDropGuard` that populated this field was
+    /// removed because it only tracked the *first* pool on a thread, giving
+    /// wrong counts for multi-pool scenarios.  Thread-local buffers are now
+    /// securely zeroed and freed by `Buffer`'s own `#[zeroize(drop)]` on
+    /// thread exit — they are not leaked.  Use `clear_thread_cache()` before
+    /// thread exit if you want to reclaim them into the global pool.
     pub thread_local_lost: usize,
 }
 

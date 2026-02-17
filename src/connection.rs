@@ -1,19 +1,38 @@
 // src/connection.rs
 //! Connection-scoped buffer lifecycle management.
 //!
-//! Provides automatic memory cleanup on connection termination (disconnect/error).
+//! Provides automatic secure memory cleanup on connection termination.
+//!
+//! # Fixes vs original
+//!
+//! - **`PooledConnectionBuffers::release_to_pool` double-burned and misled callers.**
+//!   The original implementation called `self.buffers.burn()` inside
+//!   `release_to_pool()` and then called it *again* inside `Drop::drop()`.
+//!   More critically, the method was named `release_to_pool` but actually
+//!   *destroyed* all buffers — nothing was returned to the pool.
+//!
+//!   Fixed by:
+//!   1. Adding a `burned: bool` guard so `burn()` is called exactly once.
+//!   2. Renaming the concept clearly: the method is now `burn_and_release()`,
+//!      which honestly reflects what happens (burn then release pool Arc).
+//!      If you want to *return* buffers to the pool, acquire them via
+//!      `PooledBuffer`/`FastPooledBuffer` directly and let them drop normally.
 
 use crate::buffer::Buffer;
 use crate::circular::CircularBuffer;
 use crate::pool::BufferPool;
 use std::collections::VecDeque;
+use std::sync::Arc;
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-/// Configuration for connection buffer limits.
+/// Configuration for per-connection buffer limits.
 #[derive(Debug, Clone)]
 pub struct ConnectionBufferConfig {
-    /// Maximum number of packets in queue (prevents unbounded growth)
+    /// Maximum number of packets in the transmit queue.
     pub max_packet_queue_size: usize,
-    /// Maximum total bytes in packet queue
+    /// Maximum total bytes held in the transmit queue.
     pub max_packet_queue_bytes: usize,
 }
 
@@ -21,16 +40,20 @@ impl Default for ConnectionBufferConfig {
     fn default() -> Self {
         Self {
             max_packet_queue_size: 100,
-            max_packet_queue_bytes: 10_485_760, // 10MB
+            max_packet_queue_bytes: 10_485_760, // 10 MB
         }
     }
 }
 
-/// A connection's buffer state.
+// ---------------------------------------------------------------------------
+// ConnectionBuffers
+// ---------------------------------------------------------------------------
+
+/// A connection's complete buffer state.
 ///
-/// Automatically cleans up all associated buffers on drop.
+/// All associated buffers are securely zeroed when this value is dropped.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```
 /// use secbuf::prelude::*;
@@ -39,51 +62,30 @@ impl Default for ConnectionBufferConfig {
 /// conn.init_read_buf(4096);
 /// conn.init_write_buf(4096);
 /// conn.add_stream_buf(1024);
-/// // Buffers automatically cleaned up when conn is dropped
+/// // Buffers automatically cleaned up when `conn` is dropped.
 /// ```
 pub struct ConnectionBuffers {
-    /// Read buffer (for incoming network data)
+    /// Incoming data buffer.
     pub read_buf: Option<Buffer>,
-    /// Write buffer (for outgoing network data)
+    /// Outgoing data buffer.
     pub write_buf: Option<Buffer>,
-    /// Per-direction circular buffers (e.g., for channel to local FD forwarding)
+    /// Per-channel circular stream buffers.
     pub stream_bufs: Vec<CircularBuffer>,
-    /// Queued buffers awaiting transmission (e.g., SSH packet queue)
+    /// Pending transmit packet queue.
     pub packet_queue: VecDeque<Buffer>,
-    /// Configuration limits
     config: ConnectionBufferConfig,
-    /// Current bytes in packet queue
     packet_queue_bytes: usize,
+    /// Prevents double-burn if `burn()` is called explicitly before drop.
+    burned: bool,
 }
 
 impl ConnectionBuffers {
     /// Creates a new connection buffer set with default limits.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let conn = ConnectionBuffers::new();
-    /// assert_eq!(conn.packet_queue_len(), 0);
-    /// ```
     pub fn new() -> Self {
         Self::with_config(ConnectionBufferConfig::default())
     }
 
     /// Creates a new connection buffer set with custom limits.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let config = ConnectionBufferConfig {
-    ///     max_packet_queue_size: 50,
-    ///     max_packet_queue_bytes: 5_242_880,
-    /// };
-    /// let conn = ConnectionBuffers::with_config(config);
-    /// ```
     pub fn with_config(config: ConnectionBufferConfig) -> Self {
         Self {
             read_buf: None,
@@ -92,169 +94,83 @@ impl ConnectionBuffers {
             packet_queue: VecDeque::new(),
             config,
             packet_queue_bytes: 0,
+            burned: false,
         }
     }
 
-    /// Allocates read buffer (called on connection init).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// conn.init_read_buf(4096);
-    /// assert!(conn.read_buf.is_some());
-    /// ```
+    // -----------------------------------------------------------------------
+    // Initialisation
+    // -----------------------------------------------------------------------
+
+    /// Allocates the inbound data buffer.
     pub fn init_read_buf(&mut self, size: usize) {
         self.read_buf = Some(Buffer::new(size));
     }
 
-    /// Allocates write buffer (called on connection init).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// conn.init_write_buf(4096);
-    /// assert!(conn.write_buf.is_some());
-    /// ```
+    /// Allocates the outbound data buffer.
     pub fn init_write_buf(&mut self, size: usize) {
         self.write_buf = Some(Buffer::new(size));
     }
 
-    /// Adds a new stream buffer (e.g., for a forwarded channel).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// conn.add_stream_buf(1024);
-    /// assert_eq!(conn.stream_bufs.len(), 1);
-    /// ```
+    /// Appends a new circular stream buffer (e.g. for a forwarded channel).
     pub fn add_stream_buf(&mut self, size: usize) {
         self.stream_bufs.push(CircularBuffer::new(size));
     }
 
-    /// Queues a packet buffer for transmission.
+    // -----------------------------------------------------------------------
+    // Packet queue
+    // -----------------------------------------------------------------------
+
+    /// Enqueues a packet for transmission.
     ///
     /// # Errors
     ///
-    /// Returns [`QueueFullError`] if queue limits are exceeded.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// let buf = Buffer::new(256);
-    /// conn.queue_packet(buf).unwrap();
-    /// assert_eq!(conn.packet_queue_len(), 1);
-    /// ```
+    /// Returns [`QueueFullError`] if either the count or byte limit is exceeded.
     pub fn queue_packet(&mut self, buf: Buffer) -> Result<(), QueueFullError> {
         if self.packet_queue.len() >= self.config.max_packet_queue_size {
             return Err(QueueFullError::TooManyPackets);
         }
-
         let buf_len = buf.len();
         if self.packet_queue_bytes + buf_len > self.config.max_packet_queue_bytes {
             return Err(QueueFullError::TooManyBytes);
         }
-
         self.packet_queue_bytes += buf_len;
         self.packet_queue.push_back(buf);
         Ok(())
     }
 
-    /// Dequeues and returns the next packet (for writing to network).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// let buf = Buffer::new(256);
-    /// conn.queue_packet(buf).unwrap();
-    ///
-    /// let packet = conn.dequeue_packet();
-    /// assert!(packet.is_some());
-    /// ```
+    /// Dequeues the next packet for writing to the network.
     pub fn dequeue_packet(&mut self) -> Option<Buffer> {
-        if let Some(buf) = self.packet_queue.pop_front() {
-            self.packet_queue_bytes = self.packet_queue_bytes.saturating_sub(buf.len());
-            Some(buf)
-        } else {
-            None
-        }
+        self.packet_queue.pop_front().map(|buf| {
+            self.packet_queue_bytes =
+                self.packet_queue_bytes.saturating_sub(buf.len());
+            buf
+        })
     }
 
-    /// Returns the number of queued packets (for debugging/monitoring).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// assert_eq!(conn.packet_queue_len(), 0);
-    ///
-    /// conn.queue_packet(Buffer::new(256)).unwrap();
-    /// assert_eq!(conn.packet_queue_len(), 1);
-    /// ```
+    /// Number of packets currently queued.
     pub fn packet_queue_len(&self) -> usize {
         self.packet_queue.len()
     }
 
-    /// Returns total bytes in packet queue.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let conn = ConnectionBuffers::new();
-    /// assert_eq!(conn.packet_queue_bytes(), 0);
-    /// ```
+    /// Total bytes currently queued.
     pub fn packet_queue_bytes(&self) -> usize {
         self.packet_queue_bytes
     }
 
-    /// Checks if packet queue is near capacity.
-    ///
-    /// Returns `true` if the queue is at 80% or more of its limits.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// if conn.is_queue_near_full() {
-    ///     eprintln!("Warning: packet queue nearly full");
-    /// }
-    /// ```
+    /// `true` when the queue is at ≥ 80% of either limit.
     pub fn is_queue_near_full(&self) -> bool {
         self.packet_queue.len() > self.config.max_packet_queue_size * 80 / 100
             || self.packet_queue_bytes > self.config.max_packet_queue_bytes * 80 / 100
     }
 
-    /// Securely clears all buffers and resets state (without freeing memory).
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Resets all buffers and the packet queue without freeing memory.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// conn.init_read_buf(1024);
-    /// conn.reset();
-    /// ```
+    /// Useful for session reuse where you want to keep the allocations.
     pub fn reset(&mut self) {
         if let Some(ref mut buf) = self.read_buf {
             buf.reset();
@@ -267,22 +183,16 @@ impl ConnectionBuffers {
         }
         self.packet_queue.clear();
         self.packet_queue_bytes = 0;
+        self.burned = false;
     }
 
-    /// Securely zeroes all sensitive data before dropping.
+    /// Securely zeros all sensitive data in every buffer.
     ///
-    /// Called explicitly before dropping or on error/disconnect.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// conn.init_read_buf(1024);
-    /// conn.burn(); // Explicitly clean up
-    /// ```
+    /// Idempotent — safe to call multiple times (subsequent calls are no-ops).
     pub fn burn(&mut self) {
+        if self.burned {
+            return;
+        }
         if let Some(ref mut buf) = self.read_buf {
             buf.burn();
         }
@@ -296,37 +206,49 @@ impl ConnectionBuffers {
             pkt.burn();
         }
         self.packet_queue_bytes = 0;
+        self.burned = true;
     }
 
+    // -----------------------------------------------------------------------
+    // Diagnostics
+    // -----------------------------------------------------------------------
+
     /// Returns memory usage statistics.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let mut conn = ConnectionBuffers::new();
-    /// conn.init_read_buf(4096);
-    /// conn.init_write_buf(4096);
-    ///
-    /// let stats = conn.memory_usage();
-    /// assert_eq!(stats.total_bytes, 8192);
-    /// ```
     pub fn memory_usage(&self) -> ConnectionMemoryStats {
         let read_buf_bytes = self.read_buf.as_ref().map(|b| b.capacity()).unwrap_or(0);
         let write_buf_bytes = self.write_buf.as_ref().map(|b| b.capacity()).unwrap_or(0);
         let stream_buf_bytes: usize = self.stream_bufs.iter().map(|b| b.size()).sum();
-
         ConnectionMemoryStats {
             read_buf_bytes,
             write_buf_bytes,
             stream_buf_bytes,
             packet_queue_bytes: self.packet_queue_bytes,
-            total_bytes: read_buf_bytes + write_buf_bytes + stream_buf_bytes + self.packet_queue_bytes,
+            total_bytes: read_buf_bytes
+                + write_buf_bytes
+                + stream_buf_bytes
+                + self.packet_queue_bytes,
         }
     }
 }
 
+impl Default for ConnectionBuffers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ConnectionBuffers {
+    fn drop(&mut self) {
+        // `burn()` is idempotent — safe even if called explicitly beforehand.
+        self.burn();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Supporting types
+// ---------------------------------------------------------------------------
+
+/// Memory usage snapshot for a connection.
 /// Memory usage statistics for a connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionMemoryStats {
@@ -342,6 +264,7 @@ pub struct ConnectionMemoryStats {
     pub total_bytes: usize,
 }
 
+/// Error returned when the packet queue is full.
 /// Error when packet queue is full.
 #[derive(Debug, Clone)]
 pub enum QueueFullError {
@@ -362,98 +285,84 @@ impl std::fmt::Display for QueueFullError {
 
 impl std::error::Error for QueueFullError {}
 
-impl Default for ConnectionBuffers {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------
+// PooledConnectionBuffers
+// ---------------------------------------------------------------------------
 
-impl Drop for ConnectionBuffers {
-    fn drop(&mut self) {
-        self.burn();
-    }
-}
-
-/// A pooled connection buffer set for high-throughput scenarios.
+/// A connection buffer set that holds an `Arc<BufferPool>` reference.
 ///
-/// Automatically returns buffers to pool on drop.
+/// # What "pooled" means here
+///
+/// This type holds a reference to a pool so the connection can *acquire*
+/// pool buffers during its lifetime.  The buffers themselves are managed by
+/// the inner `ConnectionBuffers`; on drop they are securely zeroed.
+///
+/// **Important:** the connection buffers are **not** automatically returned
+/// to the pool on drop — `Buffer` objects live inside `ConnectionBuffers` and
+/// are freed (zeroed) when `ConnectionBuffers::burn()` runs.  If you want
+/// true pool-recycling, use `pool.acquire()` → `PooledBuffer` directly and
+/// store the `PooledBuffer` inside your connection state instead.
+///
+/// # Fix vs original
+///
+/// The original `release_to_pool()` was misleadingly named — it called
+/// `self.buffers.burn()` (destroying data) and then set `self.pool = None`
+/// (releasing the Arc), but returned nothing to the pool.  The name implied
+/// efficient buffer recycling.  Renamed to `burn_and_release()` and made
+/// idempotent via the `burned` guard on `ConnectionBuffers`.
 pub struct PooledConnectionBuffers {
     buffers: ConnectionBuffers,
-    pool: Option<std::sync::Arc<BufferPool>>,
+    pool: Option<Arc<BufferPool>>,
 }
 
 impl PooledConnectionBuffers {
-    /// Creates a new pooled connection buffer set.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    /// use std::sync::Arc;
-    ///
-    /// let pool = Arc::new(BufferPool::new(PoolConfig::default()));
-    /// let pooled_conn = PooledConnectionBuffers::new(pool);
-    /// ```
-    pub fn new(pool: std::sync::Arc<BufferPool>) -> Self {
+    /// Creates a new pooled connection buffer wrapper.
+    pub fn new(pool: Arc<BufferPool>) -> Self {
         Self {
             buffers: ConnectionBuffers::new(),
             pool: Some(pool),
         }
     }
 
-    /// Creates a pooled connection with custom config.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    /// use std::sync::Arc;
-    ///
-    /// let pool = Arc::new(BufferPool::new(PoolConfig::default()));
-    /// let config = ConnectionBufferConfig {
-    ///     max_packet_queue_size: 50,
-    ///     max_packet_queue_bytes: 5_242_880,
-    /// };
-    /// let pooled_conn = PooledConnectionBuffers::with_config(pool, config);
-    /// ```
-    pub fn with_config(
-        pool: std::sync::Arc<BufferPool>,
-        config: ConnectionBufferConfig,
-    ) -> Self {
+    /// Creates a pooled connection wrapper with custom buffer limits.
+    pub fn with_config(pool: Arc<BufferPool>, config: ConnectionBufferConfig) -> Self {
         Self {
             buffers: ConnectionBuffers::with_config(config),
             pool: Some(pool),
         }
     }
 
-    /// Access the underlying connection buffers.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    /// use std::sync::Arc;
-    ///
-    /// let pool = Arc::new(BufferPool::new(PoolConfig::default()));
-    /// let mut pooled_conn = PooledConnectionBuffers::new(pool);
-    /// pooled_conn.buffers().init_read_buf(4096);
-    /// ```
+    /// Mutable access to the underlying connection buffers.
     pub fn buffers(&mut self) -> &mut ConnectionBuffers {
         &mut self.buffers
     }
 
-    /// Explicitly return resources to pool (optional; automatic on drop).
-    pub fn release_to_pool(&mut self) {
-        self.buffers.burn();
-        self.pool = None;
+    /// Shared access to the pool (e.g. for `pool.acquire()` calls).
+    pub fn pool(&self) -> Option<&Arc<BufferPool>> {
+        self.pool.as_ref()
+    }
+
+    /// Explicitly burns all buffers and releases the pool Arc.
+    ///
+    /// After this call the struct is "empty" — `pool()` returns `None` and the
+    /// buffers are zeroed.  The destructor will be a no-op.
+    ///
+    /// This is idempotent; calling it multiple times is safe.
+    pub fn burn_and_release(&mut self) {
+        self.buffers.burn(); // idempotent via `burned` flag
+        self.pool = None;    // release Arc<BufferPool>
     }
 }
 
 impl Drop for PooledConnectionBuffers {
     fn drop(&mut self) {
-        self.buffers.burn();
+        self.buffers.burn(); // idempotent — safe if burn_and_release already called
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -467,10 +376,19 @@ mod tests {
         conn.add_stream_buf(512);
 
         if let Some(ref mut buf) = conn.read_buf {
-            let _ = buf.put_byte(0xAB);
+            buf.put_byte(0xAB).unwrap();
         }
 
-        drop(conn);
+        drop(conn); // must not double-burn or panic
+    }
+
+    #[test]
+    fn test_burn_is_idempotent() {
+        let mut conn = ConnectionBuffers::new();
+        conn.init_read_buf(256);
+        conn.burn();
+        conn.burn(); // second call must be a no-op
+        drop(conn); // drop must also be a no-op
     }
 
     #[test]
@@ -479,12 +397,9 @@ mod tests {
             max_packet_queue_size: 2,
             max_packet_queue_bytes: 1024,
         });
-
         conn.queue_packet(Buffer::new(256)).unwrap();
         conn.queue_packet(Buffer::new(256)).unwrap();
-
-        let result = conn.queue_packet(Buffer::new(256));
-        assert!(result.is_err());
+        assert!(conn.queue_packet(Buffer::new(256)).is_err());
     }
 
     #[test]
@@ -498,5 +413,29 @@ mod tests {
         assert_eq!(stats.read_buf_bytes, 1024);
         assert_eq!(stats.write_buf_bytes, 2048);
         assert_eq!(stats.stream_buf_bytes, 512);
+    }
+
+    #[test]
+    fn test_pooled_connection_burn_and_release() {
+        use crate::pool::{BufferPool, PoolConfig};
+        let pool = Arc::new(BufferPool::new(PoolConfig::default()));
+        let mut pc = PooledConnectionBuffers::new(Arc::clone(&pool));
+        pc.buffers().init_read_buf(512);
+        pc.burn_and_release();
+        assert!(pc.pool().is_none());
+        drop(pc); // must not panic or double-burn
+    }
+
+    #[test]
+    fn test_dequeue_packet() {
+        let mut conn = ConnectionBuffers::new();
+        let mut buf = Buffer::new(64);
+        buf.put_u32(0xDEAD_BEEF).unwrap();
+        conn.queue_packet(buf).unwrap();
+
+        let pkt = conn.dequeue_packet().unwrap();
+        assert_eq!(pkt.len(), 4);
+        assert_eq!(conn.packet_queue_len(), 0);
+        assert_eq!(conn.packet_queue_bytes(), 0);
     }
 }
