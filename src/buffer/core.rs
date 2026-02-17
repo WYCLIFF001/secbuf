@@ -474,7 +474,11 @@ impl Buffer {
     /// # Ok::<(), BufferError>(())
     /// ```
     pub fn burn(&mut self) {
-        self.data.zeroize();
+        // Use as_mut_slice() NOT self.data.zeroize() — Vec::zeroize() calls
+        // Vec::clear() which sets data.len() to 0, breaking every subsequent
+        // bounds check (put_u32 checks pos + 4 > data.len()) after pool return.
+        // Slice zeroize wipes the bytes but preserves data.len() == capacity.
+        self.data.as_mut_slice().zeroize();
         self.pos = 0;
         self.len = 0;
     }
@@ -496,7 +500,7 @@ impl Buffer {
     /// # Ok::<(), BufferError>(())
     /// ```
     pub fn burn_free(mut self) {
-        self.data.zeroize();
+        self.data.as_mut_slice().zeroize();
         drop(self);
     }
 
