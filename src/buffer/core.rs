@@ -608,7 +608,7 @@ impl Buffer {
         self.data.shrink_to_fit();
     }
 
-    /// Consumes the buffer and returns the underlying Vec<u8>,
+    /// Consumes the buffer and returns the underlying `Vec<u8>`,
     /// truncated to valid data length (pos..len slice).
     ///
     /// The Vec is NOT zeroed — caller takes ownership and is responsible
