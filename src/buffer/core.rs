@@ -607,6 +607,31 @@ impl Buffer {
         self.data.truncate(self.len);
         self.data.shrink_to_fit();
     }
+
+    /// Consumes the buffer and returns the underlying Vec<u8>,
+    /// truncated to valid data length (pos..len slice).
+    ///
+    /// The Vec is NOT zeroed — caller takes ownership and is responsible
+    /// for its lifetime. Use only for non-secret data (e.g. tunnel payloads).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use secbuf::Buffer;
+    ///
+    /// let mut buf = Buffer::new(1024);
+    /// buf.put_bytes(b"hello").unwrap();
+    /// let v = buf.into_vec();
+    /// assert_eq!(v, b"hello");
+    /// ```
+    pub fn into_vec(mut self) -> Vec<u8> {
+        self.data.truncate(self.len); // trim to valid data only
+        let mut v = Vec::new();
+        std::mem::swap(&mut self.data, &mut v); // steal the allocation
+        // Now self.data is empty Vec — zeroize(drop) will zeroize nothing,
+        // and v holds the original allocation with real data
+        v
+    }
 }
 
 impl AsRef<[u8]> for Buffer {
