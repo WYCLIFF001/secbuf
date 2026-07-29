@@ -212,9 +212,7 @@ impl CircularBuffer {
         // Guard against the original panic: writing `len` bytes starting at
         // `write_pos` must not cross the ring boundary.
         if self.write_pos + len > self.size {
-            return Err(BufferError::InvalidState(
-                "write would cross ring boundary — use write_slices_mut or write()".into(),
-            ));
+            return Err(BufferError::WouldWrap);
         }
 
         self.ensure_allocated();
@@ -534,7 +532,7 @@ mod tests {
         // A 4-byte write from pos 6 in an 8-byte ring would cross the boundary.
         assert!(matches!(
             buf.write_ptr(4),
-            Err(BufferError::InvalidState(_))
+            Err(BufferError::WouldWrap)
         ));
     }
 

@@ -104,8 +104,6 @@ use secbuf::{ConnectionBuffers, ConnectionBufferConfig};
 let mut conn = ConnectionBuffers::with_config(ConnectionBufferConfig {
     max_packet_queue_size: 100,
     max_packet_queue_bytes: 10_485_760, // 10MB
-    idle_timeout_secs: 60,
-    enable_aggressive_shrinking: true,
 });
 
 // Initialize buffers as needed
@@ -201,18 +199,16 @@ use secbuf::ConnectionBuffers;
 
 let mut conn = ConnectionBuffers::new();
 conn.init_read_buf(65536);
+conn.init_write_buf(32768);
+conn.add_stream_buf(8192);
 
 // Check memory usage
 let stats = conn.memory_usage();
+println!("Read buffer:  {} bytes", stats.read_buf_bytes);
+println!("Write buffer: {} bytes", stats.write_buf_bytes);
+println!("Stream buffers: {} bytes", stats.stream_buf_bytes);
+println!("Packet queue: {} bytes", stats.packet_queue_bytes);
 println!("Total: {} bytes", stats.total_bytes);
-println!("Used: {} bytes", stats.total_used);
-println!("Wasted: {} bytes", stats.total_wasted);
-println!("Efficiency: {:.1}%", stats.efficiency() * 100.0);
-
-if stats.is_problematic() {
-    println!("Warning: Inefficient memory usage detected!");
-    conn.force_shrink(); // Reclaim wasted memory
-}
 ```
 
 ## 🔒 Security Guarantees
@@ -236,11 +232,11 @@ For extra control:
 let mut buf = Buffer::new(1024);
 buf.put_bytes(b"secret")?;
 
-// Immediate secure zeroing
+// Immediate secure zeroing (keeps allocation)
 buf.burn();
 
-// Or zero + free memory
-buf.burn_and_free_memory();
+// Or zero + free memory (consumes the buffer)
+buf.burn_free();
 ```
 
 ### Connection Cleanup
@@ -250,9 +246,11 @@ let mut conn = ConnectionBuffers::new();
 conn.init_read_buf(8192);
 // ... use buffers
 
-// Secure cleanup
-conn.burn(); // Zero all data
-conn.aggressive_cleanup(); // Zero + free all memory
+// Secure cleanup — zero all data in every buffer
+conn.burn();
+
+// Reset for reuse without freeing memory
+conn.reset();
 ```
 
 ## ⚡ Performance
@@ -301,10 +299,9 @@ cargo bench
 
 ## 🛠️ Feature Flags
 
-Currently, all features are enabled by default. Future versions may add:
+All features are opt-in:
 
-- `simd` - SIMD acceleration (planned)
-- `anyhow` - Error conversion support (planned)
+- `anyhow` — Enables bidirectional error conversion with the [`anyhow`](https://crates.io/crates/anyhow) crate, including the `ResultExt` trait for ergonomic `anyhow::Result` conversion.
 
 ## 🤝 Contributing
 

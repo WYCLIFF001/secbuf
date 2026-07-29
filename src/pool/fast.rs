@@ -244,6 +244,7 @@ impl FastBufferPool {
     /// Returns a snapshot of pool statistics.
     ///
     /// All counters use `Relaxed` ordering; values are eventually consistent.
+    #[allow(deprecated)]
     pub fn stats(&self) -> FastPoolStats {
         FastPoolStats {
             available: self.global_pool.len(),
@@ -290,12 +291,12 @@ impl FastBufferPool {
     pub fn clear_thread_cache(&self) {
         THREAD_CACHE.with(|cache| {
             let mut c = cache.borrow_mut();
-            while let Some(mut buf) = c.pop() {
+            while let Some(buf) = c.pop() {
                 if self.global_pool.len() < self.config.max_pool_size {
                     // buf is already burned by the return path; push as-is.
                     self.global_pool.push(buf);
                 } else {
-                    buf.burn();
+                    // Buffer is already burned from being returned to the cache.
                     drop(buf);
                 }
             }

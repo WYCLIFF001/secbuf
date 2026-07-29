@@ -248,7 +248,6 @@ impl Drop for ConnectionBuffers {
 // Supporting types
 // ---------------------------------------------------------------------------
 
-/// Memory usage snapshot for a connection.
 /// Memory usage statistics for a connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionMemoryStats {
@@ -264,7 +263,6 @@ pub struct ConnectionMemoryStats {
     pub total_bytes: usize,
 }
 
-/// Error returned when the packet queue is full.
 /// Error when packet queue is full.
 #[derive(Debug, Clone)]
 pub enum QueueFullError {

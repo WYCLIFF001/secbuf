@@ -19,6 +19,8 @@ pub enum BufferError {
     BufferFull,
     /// Circular buffer is empty
     BufferEmpty,
+    /// Write would cross circular buffer ring boundary
+    WouldWrap,
     /// Write would exceed available space
     InsufficientSpace,
     /// Invalid string encoding
@@ -39,6 +41,7 @@ impl fmt::Display for BufferError {
             Self::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
             Self::BufferFull => write!(f, "Circular buffer is full"),
             Self::BufferEmpty => write!(f, "Circular buffer is empty"),
+            Self::WouldWrap => write!(f, "Write would cross ring boundary — use write_slices_mut or write()"),
             Self::InsufficientSpace => write!(f, "Insufficient space in buffer"),
             Self::InvalidString => write!(f, "Invalid string encoding"),
             Self::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
@@ -58,7 +61,9 @@ impl From<BufferError> for std::io::Error {
     fn from(err: BufferError) -> Self {
         use std::io::ErrorKind;
         match err {
-            BufferError::BufferOverflow | BufferError::InsufficientSpace => {
+            BufferError::BufferOverflow
+            | BufferError::InsufficientSpace
+            | BufferError::WouldWrap => {
                 std::io::Error::new(ErrorKind::WriteZero, err)
             }
             BufferError::BufferEmpty => std::io::Error::new(ErrorKind::UnexpectedEof, err),
@@ -101,18 +106,18 @@ pub type Result<T> = std::result::Result<T, BufferError>;
 // EXTENSION TRAIT FOR EASY CONVERSION
 // ============================================================================
 
-/// Extension trait for converting Results between different error types
+/// Extension trait for converting Results between different error types.
+#[cfg(feature = "anyhow")]
 pub trait ResultExt<T> {
     /// Convert to anyhow::Result
-    #[cfg(feature = "anyhow")]
     fn into_anyhow(self) -> anyhow::Result<T>;
 
     /// Convert to io::Result
     fn into_io(self) -> std::io::Result<T>;
 }
 
+#[cfg(feature = "anyhow")]
 impl<T> ResultExt<T> for Result<T> {
-    #[cfg(feature = "anyhow")]
     fn into_anyhow(self) -> anyhow::Result<T> {
         self.map_err(|e| e.into())
     }
@@ -177,6 +182,7 @@ mod tests {
         assert_eq!(io_err.kind(), std::io::ErrorKind::WriteZero);
     }
 
+    #[cfg(feature = "anyhow")]
     #[test]
     fn test_result_ext() {
         let result: Result<u32> = Ok(42);

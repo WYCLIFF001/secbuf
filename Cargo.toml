@@ -1,6 +1,6 @@
 [package]
 name = "secbuf"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["WYCLIFF <wycliffomondi01@gmail.com>"]
@@ -53,7 +53,3 @@ debug = true
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
-
-# CPU-specific optimizations (uncomment for your platform)
-# [build]
-# rustflags = ["-C", "target-cpu=native"]

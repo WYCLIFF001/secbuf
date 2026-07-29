@@ -6,7 +6,11 @@
 pub struct PoolStats {
     /// Number of buffers currently available in the pool
     pub available: usize,
-    /// Total number of buffers allocated since pool creation
+    /// Total number of on-demand allocations during [`BufferPool::acquire`].
+    ///
+    /// Pre-warmed buffers (from [`PoolConfig::min_pool_size`]) are NOT counted
+    /// here — they are pool infrastructure, not demand-driven allocations.
+    /// The `hit_rate()` formula depends on this distinction.
     pub total_allocated: usize,
     /// Total number of acquire() calls
     pub total_acquired: usize,
@@ -68,7 +72,10 @@ impl PoolStats {
 pub struct FastPoolStats {
     /// Number of buffers currently available in the global pool
     pub available: usize,
-    /// Total number of new buffers allocated
+    /// Total number of on-demand allocations during [`FastBufferPool::acquire`].
+    ///
+    /// Pre-warmed buffers (from [`PoolConfig::min_pool_size`]) are NOT counted
+    /// here — they are pool infrastructure, not demand-driven allocations.
     pub allocated: usize,
     /// Total number of acquire() calls
     pub acquired: usize,
@@ -85,6 +92,10 @@ pub struct FastPoolStats {
     /// securely zeroed and freed by `Buffer`'s own `#[zeroize(drop)]` on
     /// thread exit — they are not leaked.  Use `clear_thread_cache()` before
     /// thread exit if you want to reclaim them into the global pool.
+    #[deprecated(
+        since = "0.1.8",
+        note = "Always 0. Thread-local buffers are securely freed on thread exit, not lost."
+    )]
     pub thread_local_lost: usize,
 }
 
@@ -161,46 +172,24 @@ impl FastPoolStats {
     ///
     /// Returns the number of bytes lost to thread-local caches when threads exit.
     ///
-    /// # Arguments
-    ///
-    /// * `buffer_size` - The size of each buffer in bytes
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let pool = FastBufferPool::new(PoolConfig {
-    ///     buffer_size: 8192,
-    ///     max_pool_size: 100,
-    ///     min_pool_size: 10,
-    /// });
-    ///
-    /// let stats = pool.stats();
-    /// let leaked_bytes = stats.leaked_bytes(8192);
-    /// assert_eq!(leaked_bytes, stats.thread_local_lost * 8192);
-    /// ```
+    /// Always returns 0 in the current implementation.
+    #[deprecated(
+        since = "0.1.8",
+        note = "Always returns 0. Thread-local buffers are securely freed on thread exit."
+    )]
+    #[allow(deprecated)]
     pub fn leaked_bytes(&self, buffer_size: usize) -> usize {
         self.thread_local_lost * buffer_size
     }
 
     /// Checks if the leak rate is concerning.
     ///
-    /// Returns `true` if more than 10% of allocated buffers have been lost
-    /// to dead threads.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use secbuf::prelude::*;
-    ///
-    /// let pool = FastBufferPool::new(PoolConfig::default());
-    /// let stats = pool.stats();
-    ///
-    /// if stats.has_leak_concern() {
-    ///     eprintln!("Warning: High buffer leak rate detected!");
-    /// }
-    /// ```
+    /// Always returns `false` in the current implementation.
+    #[deprecated(
+        since = "0.1.8",
+        note = "Always returns false. Thread-local buffers are securely freed on thread exit."
+    )]
+    #[allow(deprecated)]
     pub fn has_leak_concern(&self) -> bool {
         if self.allocated == 0 {
             return false;
